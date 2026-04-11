@@ -383,7 +383,7 @@ def parse_temp_range(question):
     m = re.search(r'be ' + num + r'[°]?[FC] on', question, re.IGNORECASE)
     if m:
         v = float(m.group(1))
-        return (v, v)
+        return (v - 0.5, v + 0.5)
     return None
 
 def hours_until_resolution(event):
