@@ -1,0 +1,56 @@
+{
+  "balance": 9800.0,
+  "starting_balance": 10000.0,
+  "positions": {
+    "1924528": {
+      "question": "Will the highest temperature in Tokyo be 23\u00b0C or higher on April 13?",
+      "entry_price": 0.405,
+      "shares": 246.91,
+      "cost": 100.0,
+      "date": "2026-04-13",
+      "city": "tokyo",
+      "consensus_temp": 22.8,
+      "confidence": "MEDIUM",
+      "edge": 0.288,
+      "opened_at": "2026-04-11T14:19:43.213185"
+    },
+    "1914823": {
+      "question": "Will the highest temperature in Seoul be 14\u00b0C or below on April 12?",
+      "entry_price": 0.048,
+      "shares": 2083.33,
+      "cost": 100.0,
+      "date": "2026-04-12",
+      "city": "seoul",
+      "consensus_temp": 15.4,
+      "confidence": "MEDIUM",
+      "edge": 0.3636,
+      "opened_at": "2026-04-11T14:19:43.420016"
+    }
+  },
+  "trades": [
+    {
+      "type": "entry",
+      "question": "Will the highest temperature in Tokyo be 23\u00b0C or higher on April 13?",
+      "entry_price": 0.405,
+      "shares": 246.91,
+      "cost": 100.0,
+      "date": "2026-04-13",
+      "city": "tokyo",
+      "opened_at": "2026-04-11T14:19:43.213194"
+    },
+    {
+      "type": "entry",
+      "question": "Will the highest temperature in Seoul be 14\u00b0C or below on April 12?",
+      "entry_price": 0.048,
+      "shares": 2083.33,
+      "cost": 100.0,
+      "date": "2026-04-12",
+      "city": "seoul",
+      "opened_at": "2026-04-11T14:19:43.420024"
+    }
+  ],
+  "total_trades": 2,
+  "wins": 0,
+  "losses": 0,
+  "peak_balance": 10000.0
+}
