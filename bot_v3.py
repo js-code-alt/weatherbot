@@ -524,8 +524,25 @@ def check_exits(sim):
             cost = pos["cost"]
             shares = pos["shares"]
 
+            # Fetch actual observed temperature for calibration
+            actual_temp = None
+            city_slug = pos.get("city", "")
+            if city_slug in LOCATIONS:
+                loc_info = LOCATIONS[city_slug]
+                try:
+                    obs_url = (f"https://archive-api.open-meteo.com/v1/archive"
+                               f"?latitude={loc_info['lat']}&longitude={loc_info['lon']}"
+                               f"&daily=temperature_2m_max&temperature_unit={loc_info['unit']}"
+                               f"&timezone=auto&start_date={pos.get('date')}&end_date={pos.get('date')}")
+                    obs_data = _get(obs_url, timeout=10).json()
+                    obs_temps = obs_data.get("daily", {}).get("temperature_2m_max", [])
+                    if obs_temps and obs_temps[0] is not None:
+                        actual_temp = obs_temps[0]
+                except Exception:
+                    pass
+
             if resolved:  # YES won — we win
-                pnl = round(shares * (1.0 - entry), 2)
+                pnl = round(shares * 1.0 - cost, 2)
                 balance += cost + pnl
                 sim["wins"] += 1
                 result_str = f"{C.GREEN}WIN +${pnl:.2f}{C.RESET}"
@@ -534,7 +551,8 @@ def check_exits(sim):
                 sim["losses"] += 1
                 result_str = f"{C.RED}LOSS -${cost:.2f}{C.RESET}"
 
-            ok(f"RESOLVED: {pos['question'][:50]}... | {result_str}")
+            actual_str = f" | Actual: {actual_temp}°" if actual_temp else ""
+            ok(f"RESOLVED: {pos['question'][:50]}... | {result_str}{actual_str}")
             log_signal({
                 "type": "resolution",
                 "city": pos.get("city", ""),
@@ -545,6 +563,10 @@ def check_exits(sim):
                 "pnl": pnl,
                 "result": "win" if resolved else "loss",
                 "market_id": mid,
+                "actual_temp": actual_temp,
+                "consensus_temp": pos.get("consensus_temp"),
+                "model_probability": pos.get("model_prob"),
+                "model_spread": pos.get("model_spread"),
             })
 
             sim["trades"].append({
@@ -853,6 +875,9 @@ def run(dry_run=True):
                         "date": date_str,
                         "city": city_slug,
                         "consensus_temp": consensus,
+                        "model_prob": rung["model_prob"],
+                        "model_spread": model_spread,
+                        "sigma_used": sigma,
                         "confidence": rung["confidence"],
                         "edge": rung["edge"],
                         "opened_at": datetime.now().isoformat(),
