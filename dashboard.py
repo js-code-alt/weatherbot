@@ -166,7 +166,7 @@ def positions_section(sim):
         # Extract the temp target from question
         target = question.split("be ")[-1].split(" on ")[0] if "be " in question else "?"
 
-        potential_win = shares * (1.0 - entry) - cost
+        potential_win = shares * 1.0 - cost
         potential_loss = cost
 
         print()
