@@ -278,25 +278,20 @@ def apply_sigma_floor(sigma, days_out):
 # MONTE CARLO PROBABILITY ENGINE
 # =============================================================================
 
-def monte_carlo_bucket_probs(consensus, sigma, ensemble_members, buckets, n_sims=MC_SIMS):
+def monte_carlo_bucket_probs(consensus, sigma, buckets, n_sims=MC_SIMS):
     """Run Monte Carlo simulations to estimate probability of each temperature bucket.
 
-    If ensemble members available: bootstrap from members + small noise.
-    Otherwise: normal distribution around consensus.
+    Samples from N(consensus, sigma) where consensus is the weighted average
+    of all forecast sources and sigma incorporates ensemble spread.
 
     Returns dict of bucket_key -> probability.
     """
     sims = []
-    if ensemble_members and len(ensemble_members) >= 5:
-        # Bootstrap from ensemble members + small perturbation
-        noise_scale = sigma * 0.3
-        for _ in range(n_sims):
-            base = random.choice(ensemble_members)
-            sims.append(base + random.gauss(0, noise_scale))
-    else:
-        # Normal distribution around consensus
-        for _ in range(n_sims):
-            sims.append(random.gauss(consensus, sigma))
+    # Always sample around the weighted consensus (which already incorporates
+    # ECMWF, GFS, NWS, and ensemble mean with proper weights).
+    # Ensemble std dev already feeds into sigma via compute_consensus().
+    for _ in range(n_sims):
+        sims.append(random.gauss(consensus, sigma))
 
     # Count how many simulations land in each bucket
     bucket_probs = {}
@@ -780,9 +775,8 @@ def run(dry_run=True):
                 continue
 
             # Run Monte Carlo
-            ensemble_members = ens["members"] if ens else None
             bucket_probs = monte_carlo_bucket_probs(
-                consensus, sigma, ensemble_members, buckets)
+                consensus, sigma, buckets)
 
             # Build ladder
             ladder = build_ladder(

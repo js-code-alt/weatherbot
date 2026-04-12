@@ -99,20 +99,19 @@ class TestMonteCarlo(unittest.TestCase):
             "65-70": (65, 70),
         }
         random.seed(42)
-        probs = bot_v3.monte_carlo_bucket_probs(72.5, 2.0, None, buckets, n_sims=50000)
+        probs = bot_v3.monte_carlo_bucket_probs(72.5, 2.0, buckets, n_sims=50000)
         # 70-75 bucket should have highest prob (consensus=72.5 is inside)
         self.assertGreater(probs["70-75"], 0.5)
         # Total prob across these 3 should be < 1 (some sims land outside)
         total = sum(probs.values())
         self.assertLess(total, 1.0)
 
-    def test_ensemble_bootstrap(self):
-        """With ensemble members, MC bootstraps from them."""
-        members = [71, 72, 73, 74, 75, 72, 73, 71, 74, 73]
+    def test_consensus_centered(self):
+        """MC should center on consensus regardless of ensemble availability."""
         buckets = {"70-75": (70, 75), "75-80": (75, 80)}
         random.seed(42)
-        probs = bot_v3.monte_carlo_bucket_probs(72.5, 1.5, members, buckets, n_sims=10000)
-        # Most ensemble members are 70-75, so that bucket should dominate
+        probs = bot_v3.monte_carlo_bucket_probs(72.5, 1.5, buckets, n_sims=10000)
+        # Consensus=72.5 is inside 70-75, so that bucket should dominate
         self.assertGreater(probs["70-75"], 0.7)
 
     def test_edge_buckets(self):
@@ -123,7 +122,7 @@ class TestMonteCarlo(unittest.TestCase):
             "80-999": (80, 999),
         }
         random.seed(42)
-        probs = bot_v3.monte_carlo_bucket_probs(62.0, 2.0, None, buckets, n_sims=50000)
+        probs = bot_v3.monte_carlo_bucket_probs(62.0, 2.0, buckets, n_sims=50000)
         # "60-65" should have high prob since consensus is 62
         self.assertGreater(probs["60-65"], 0.4)
         # "or below 60" should have some probability
@@ -141,7 +140,7 @@ class TestMonteCarlo(unittest.TestCase):
             "75-999": (75, 999),
         }
         random.seed(42)
-        probs = bot_v3.monte_carlo_bucket_probs(67.0, 3.0, None, buckets, n_sims=50000)
+        probs = bot_v3.monte_carlo_bucket_probs(67.0, 3.0, buckets, n_sims=50000)
         total = sum(probs.values())
         self.assertAlmostEqual(total, 1.0, places=1)
 
@@ -149,9 +148,9 @@ class TestMonteCarlo(unittest.TestCase):
         """Larger sigma should spread probability across more buckets."""
         buckets = {"70-75": (70, 75), "65-70": (65, 70), "75-80": (75, 80)}
         random.seed(42)
-        narrow = bot_v3.monte_carlo_bucket_probs(72.5, 1.0, None, buckets, n_sims=20000)
+        narrow = bot_v3.monte_carlo_bucket_probs(72.5, 1.0, buckets, n_sims=20000)
         random.seed(42)
-        wide = bot_v3.monte_carlo_bucket_probs(72.5, 5.0, None, buckets, n_sims=20000)
+        wide = bot_v3.monte_carlo_bucket_probs(72.5, 5.0, buckets, n_sims=20000)
         # Narrow sigma: center bucket should have more mass
         self.assertGreater(narrow["70-75"], wide["70-75"])
 
