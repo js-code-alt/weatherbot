@@ -319,10 +319,24 @@ def signals_section():
             if isinstance(prob, (int, float)) and prob > 0:
                 print(f"  🔍 {colored(ago, C.DIM):>12s}  {city:<10s}  SCAN  prob {prob:.0%}  edge {fmt_edge(edge)}")
 
+def next_scan_str():
+    """Calculate time until next hourly cron scan (runs at :00)."""
+    now = datetime.now(timezone.utc)
+    # Next full hour
+    next_hour = now.replace(minute=0, second=0, microsecond=0)
+    if next_hour <= now:
+        next_hour = next_hour.replace(hour=next_hour.hour + 1)
+    delta = next_hour - now
+    mins = int(delta.total_seconds() / 60)
+    if mins <= 1:
+        return colored("⚡ scanning now", C.GREEN)
+    return f"in {mins}m ({next_hour.strftime('%H:%M')} UTC)"
+
 def footer(sim):
     total_trades = sim.get("total_trades", 0)
     print()
     print(colored("  " + "─" * 62, C.DIM))
+    print(f"  Next scan: {next_scan_str()}")
     print(colored(f"  {total_trades} total trades  ·  Scans hourly  ·  Quarter-Kelly sizing  ·  12 cities", C.DIM))
     print()
 
