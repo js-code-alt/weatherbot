@@ -562,6 +562,11 @@ def check_exits(sim):
                 "consensus_temp": pos.get("consensus_temp"),
                 "model_probability": pos.get("model_prob"),
                 "model_spread": pos.get("model_spread"),
+                "sigma_used": pos.get("sigma_used"),
+                "confidence": pos.get("confidence"),
+                "edge": pos.get("edge"),
+                "horizon": pos.get("horizon"),
+                "bucket": pos.get("bucket"),
             })
 
             sim["trades"].append({
@@ -874,6 +879,8 @@ def run(dry_run=True):
                         "sigma_used": sigma,
                         "confidence": rung["confidence"],
                         "edge": rung["edge"],
+                        "horizon": day_offset,
+                        "bucket": bkey,
                         "opened_at": datetime.now().isoformat(),
                     }
                     sim["total_trades"] += 1
