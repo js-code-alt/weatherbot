@@ -589,9 +589,9 @@ def check_exits(sim):
         # Take-profit: price >= 0.75 (lock in gains)
         if current >= 0.75:
             reason = "take_profit"
-        # Stop-loss: price dropped below 50% of entry
-        elif current <= entry * 0.50 and entry > 0.05:
-            reason = "stop_loss"
+        # No stop-loss: these are binary markets with capped downside ($cost).
+        # Price drops before resolution are noise, not a reason to sell.
+        # Max loss is already limited to the $100 bet.
 
         if reason:
             pnl = round((current - entry) * shares, 2)
