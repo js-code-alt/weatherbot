@@ -25,7 +25,7 @@ from urllib.error import URLError
 # ── Config (must match bot_v3.py) ──
 
 WEIGHTS = {"ecmwf": 0.35, "gfs": 0.25, "ensemble": 0.20}
-SIGMA_FLOORS = {0: 1.3, 1: 1.5, 2: 1.8, 3: 2.5, 4: 3.0}
+SIGMA_FLOORS = {0: 1.3, 1: 1.7, 2: 2.2, 3: 2.9, 4: 3.2}
 MC_SIMS = 10000
 
 LOCATIONS = {
