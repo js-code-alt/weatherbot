@@ -11,15 +11,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Deploy files to server
-        env:
-          SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
-          HOST: 62.238.9.129
-        run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H $HOST >> ~/.ssh/known_hosts 2>/dev/null
-
-          scp -o StrictHostKeyChecking=no \
-            bot_v3.py analytics.py dashboard.py backtest.py config.json \
-            root@$HOST:/root/
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: 62.238.9.129
+          username: root
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          source: "bot_v3.py,analytics.py,dashboard.py,backtest.py,config.json"
+          target: /root/
+          strip_components: 0
