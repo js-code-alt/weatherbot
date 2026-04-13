@@ -50,7 +50,7 @@ LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "weather-signals.ndjson"
 
 # Sigma floors by forecast horizon (days out)
-SIGMA_FLOORS = {0: 1.3, 1: 1.5, 2: 1.8, 3: 2.5, 4: 3.0}
+SIGMA_FLOORS = {0: 1.3, 1: 1.7, 2: 2.2, 3: 2.9, 4: 3.2}
 
 # =============================================================================
 # LOCATIONS — Airport stations matching Polymarket resolution
