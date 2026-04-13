@@ -41,8 +41,24 @@ MC_SIMS         = _cfg.get("mc_sims", 10000)
 MAX_LADDER_RUNGS = _cfg.get("max_ladder_rungs", 5)
 SCAN_INTERVAL   = _cfg.get("scan_interval", 3600)
 
-# Forecast weights: ECMWF 35%, GFS 25%, NWS 20%, Ensemble mean 20%
-WEIGHTS = {"ecmwf": 0.35, "gfs": 0.25, "nws": 0.20, "ensemble": 0.20}
+# Forecast weights: ECMWF 30%, GFS 20%, NWS 15%, ICON 15%, Ensemble mean 20%
+WEIGHTS = {"ecmwf": 0.30, "gfs": 0.20, "nws": 0.15, "icon": 0.15, "ensemble": 0.20}
+
+# Per-city bias correction (forecast - actual). Subtract from model before consensus.
+# Computed via: python backtest.py --compute-biases (2026-04-13, 30-day window)
+CITY_BIASES = {
+    "nyc": {"ecmwf": -1.43, "icon": -0.7},
+    "chicago": {"ecmwf": -0.64, "gfs": 2.03, "icon": 0.51},
+    "miami": {"ecmwf": -1.55, "gfs": 0.58, "icon": 1.18},
+    "dallas": {"ecmwf": -0.53, "gfs": 1.07, "icon": 1.4},
+    "seattle": {"ecmwf": -1.02, "icon": -0.48},
+    "atlanta": {"ecmwf": -0.56, "gfs": 1.33},
+    "denver": {"gfs": -1.08, "icon": -0.77},
+    "phoenix": {"icon": 0.53},
+    "london": {"icon": 0.55},
+    "tokyo": {"ecmwf": 0.58, "icon": 1.14},
+    "paris": {"gfs": 0.41, "icon": 0.76},
+}
 
 SIM_FILE = "simulation_v3.json"
 LOG_DIR  = Path("logs")
@@ -169,6 +185,25 @@ def fetch_gfs(loc: dict, dates: list) -> dict:
         warn(f"GFS {loc['name']}: {e}")
     return {}
 
+def fetch_icon(loc: dict, dates: list) -> dict:
+    """DWD ICON via Open-Meteo. Works globally."""
+    temp_unit = loc["unit"]
+    url = (f"https://api.open-meteo.com/v1/dwd-icon"
+           f"?latitude={loc['lat']}&longitude={loc['lon']}"
+           f"&daily=temperature_2m_max,temperature_2m_min"
+           f"&temperature_unit={temp_unit}&timezone=auto&forecast_days=5")
+    try:
+        data = _get(url).json()
+        if "error" not in data:
+            result = {}
+            for d, t in zip(data["daily"]["time"], data["daily"]["temperature_2m_max"]):
+                if d in dates and t is not None:
+                    result[d] = round(t, 1) if temp_unit == "celsius" else round(t)
+            return result
+    except Exception as e:
+        warn(f"ICON {loc['name']}: {e}")
+    return {}
+
 def fetch_nws(loc: dict, dates: list) -> dict:
     """NWS hourly forecast. US stations only."""
     nws_grid = loc.get("nws")
@@ -235,7 +270,7 @@ def fetch_ensemble(loc: dict, dates: list) -> dict:
 # WEIGHTED CONSENSUS + UNCERTAINTY
 # =============================================================================
 
-def compute_consensus(ecmwf_temp, gfs_temp, nws_temp, ensemble_data):
+def compute_consensus(ecmwf_temp, gfs_temp, nws_temp, icon_temp, ensemble_data, city_slug=None):
     """Weighted consensus from available models. Returns (consensus_temp, sigma, model_spread, sources)."""
     available = {}
     if ecmwf_temp is not None:
@@ -244,24 +279,37 @@ def compute_consensus(ecmwf_temp, gfs_temp, nws_temp, ensemble_data):
         available["gfs"] = gfs_temp
     if nws_temp is not None:
         available["nws"] = nws_temp
+    if icon_temp is not None:
+        available["icon"] = icon_temp
     if ensemble_data and "mean" in ensemble_data:
         available["ensemble"] = ensemble_data["mean"]
 
     if not available:
         return None, None, None, {}
 
+    # Apply per-city bias correction (subtract known forecast bias)
+    biases = CITY_BIASES.get(city_slug, {}) if city_slug else {}
+    corrected = {}
+    for k, v in available.items():
+        corrected[k] = v - biases.get(k, 0)
+
     # Redistribute weights proportionally among available models
-    total_weight = sum(WEIGHTS[k] for k in available)
-    weighted_sum = sum(available[k] * WEIGHTS[k] / total_weight for k in available)
+    total_weight = sum(WEIGHTS[k] for k in corrected)
+    weighted_sum = sum(corrected[k] * WEIGHTS[k] / total_weight for k in corrected)
     consensus = round(weighted_sum, 1)
 
     # Model spread
-    temps = list(available.values())
+    temps = list(corrected.values())
     model_spread = max(temps) - min(temps) if len(temps) > 1 else 0
 
-    # Sigma estimation
+    # Sigma estimation: blend ensemble std with model spread
     if ensemble_data and "std" in ensemble_data:
-        sigma = ensemble_data["std"]
+        ens_sigma = ensemble_data["std"]
+        if len(temps) > 1:
+            model_sigma = model_spread / 2.0
+            sigma = 0.7 * ens_sigma + 0.3 * model_sigma
+        else:
+            sigma = ens_sigma
     elif len(temps) > 1:
         sigma = model_spread / 2.0
     else:
@@ -278,20 +326,21 @@ def apply_sigma_floor(sigma, days_out):
 # MONTE CARLO PROBABILITY ENGINE
 # =============================================================================
 
-def monte_carlo_bucket_probs(consensus, sigma, buckets, n_sims=MC_SIMS):
+def monte_carlo_bucket_probs(consensus, sigma, buckets, n_sims=MC_SIMS, df=5):
     """Run Monte Carlo simulations to estimate probability of each temperature bucket.
 
-    Samples from N(consensus, sigma) where consensus is the weighted average
-    of all forecast sources and sigma incorporates ensemble spread.
+    Samples from Student's t(consensus, sigma, df) for heavier tails than Gaussian.
+    df=5 gives ~10% more tail mass, better matching real forecast error distributions.
 
     Returns dict of bucket_key -> probability.
     """
     sims = []
-    # Always sample around the weighted consensus (which already incorporates
-    # ECMWF, GFS, NWS, and ensemble mean with proper weights).
-    # Ensemble std dev already feeds into sigma via compute_consensus().
     for _ in range(n_sims):
-        sims.append(random.gauss(consensus, sigma))
+        # Student's t via Gaussian/chi-squared ratio (no scipy needed)
+        z = random.gauss(0, 1)
+        v = random.gammavariate(df / 2.0, 2.0)
+        t_sample = z / math.sqrt(v / df)
+        sims.append(consensus + sigma * t_sample)
 
     # Count how many simulations land in each bucket
     bucket_probs = {}
@@ -717,9 +766,10 @@ def run(dry_run=True):
 
         dates = [(datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
 
-        # Fetch all forecasts in parallel (conceptually — sequential here for simplicity)
+        # Fetch all forecasts
         ecmwf_data = fetch_ecmwf(loc, dates)
         gfs_data = fetch_gfs(loc, dates)
+        icon_data = fetch_icon(loc, dates)
         nws_data = fetch_nws(loc, dates) if "nws" in loc else {}
         ensemble_data = fetch_ensemble(loc, dates)
 
@@ -730,11 +780,12 @@ def run(dry_run=True):
             # Get forecasts for this date
             ecmwf_temp = ecmwf_data.get(date_str)
             gfs_temp = gfs_data.get(date_str)
+            icon_temp = icon_data.get(date_str)
             nws_temp = nws_data.get(date_str)
             ens = ensemble_data.get(date_str)
 
             consensus, sigma, model_spread, sources = compute_consensus(
-                ecmwf_temp, gfs_temp, nws_temp, ens)
+                ecmwf_temp, gfs_temp, nws_temp, icon_temp, ens, city_slug)
             if consensus is None:
                 continue
 
