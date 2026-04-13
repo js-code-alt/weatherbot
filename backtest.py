@@ -24,9 +24,25 @@ from urllib.error import URLError
 
 # ── Config (must match bot_v3.py) ──
 
-WEIGHTS = {"ecmwf": 0.35, "gfs": 0.25, "ensemble": 0.20}
+WEIGHTS = {"ecmwf": 0.30, "gfs": 0.20, "icon": 0.15, "ensemble": 0.20}
 SIGMA_FLOORS = {0: 1.3, 1: 1.7, 2: 2.2, 3: 2.9, 4: 3.2}
 MC_SIMS = 10000
+
+# Per-city bias correction (populated by --compute-biases, 2026-04-13, 30-day window)
+CITY_BIASES = {
+    "nyc": {"ecmwf": -1.43, "icon": -0.7},
+    "chicago": {"ecmwf": -0.64, "gfs": 2.03, "icon": 0.51},
+    "miami": {"ecmwf": -1.55, "gfs": 0.58, "icon": 1.18},
+    "dallas": {"ecmwf": -0.53, "gfs": 1.07, "icon": 1.4},
+    "seattle": {"ecmwf": -1.02, "icon": -0.48},
+    "atlanta": {"ecmwf": -0.56, "gfs": 1.33},
+    "denver": {"gfs": -1.08, "icon": -0.77},
+    "phoenix": {"icon": 0.53},
+    "london": {"icon": 0.55},
+    "tokyo": {"ecmwf": 0.58, "icon": 1.14},
+    "seoul": {"ecmwf": -2.48, "gfs": -6.23, "icon": -4.17},
+    "paris": {"gfs": 0.41, "icon": 0.76},
+}
 
 LOCATIONS = {
     "nyc":     {"lat": 40.7772, "lon": -73.8726, "unit": "fahrenheit", "name": "New York"},
@@ -135,29 +151,56 @@ def fetch_historical_gfs(loc, start_date, end_date):
     return {d: t for d, t in zip(dates, temps) if t is not None}
 
 
+def fetch_historical_icon(loc, start_date, end_date):
+    """Fetch ICON historical daily max temps."""
+    url = (f"https://historical-forecast-api.open-meteo.com/v1/forecast"
+           f"?latitude={loc['lat']}&longitude={loc['lon']}"
+           f"&daily=temperature_2m_max&temperature_unit={loc['unit']}"
+           f"&timezone=auto&start_date={start_date}&end_date={end_date}"
+           f"&models=icon_seamless")
+    data = fetch_json(url)
+    if not data or "daily" not in data:
+        return {}
+    dates = data["daily"].get("time", [])
+    temps = data["daily"].get("temperature_2m_max", [])
+    return {d: t for d, t in zip(dates, temps) if t is not None}
+
+
 # ── Core Engine (copied from bot_v3.py) ──
 
-def compute_consensus(ecmwf_temp, gfs_temp, ensemble_mean=None, ensemble_std=None):
+def compute_consensus(ecmwf_temp, gfs_temp, icon_temp=None, ensemble_mean=None, ensemble_std=None, city_slug=None):
     available = {}
     if ecmwf_temp is not None:
         available["ecmwf"] = ecmwf_temp
     if gfs_temp is not None:
         available["gfs"] = gfs_temp
+    if icon_temp is not None:
+        available["icon"] = icon_temp
     if ensemble_mean is not None:
         available["ensemble"] = ensemble_mean
 
     if not available:
         return None, None, None
 
-    total_weight = sum(WEIGHTS[k] for k in available)
-    consensus = sum(available[k] * WEIGHTS[k] / total_weight for k in available)
+    # Apply per-city bias correction
+    biases = CITY_BIASES.get(city_slug, {}) if city_slug else {}
+    corrected = {}
+    for k, v in available.items():
+        corrected[k] = v - biases.get(k, 0)
+
+    total_weight = sum(WEIGHTS[k] for k in corrected)
+    consensus = sum(corrected[k] * WEIGHTS[k] / total_weight for k in corrected)
     consensus = round(consensus, 1)
 
-    temps = list(available.values())
+    temps = list(corrected.values())
     spread = max(temps) - min(temps) if len(temps) > 1 else 0
 
+    # Sigma: blend ensemble std with model spread
     if ensemble_std is not None:
-        sigma = ensemble_std
+        if len(temps) > 1:
+            sigma = 0.7 * ensemble_std + 0.3 * (spread / 2.0)
+        else:
+            sigma = ensemble_std
     elif len(temps) > 1:
         sigma = spread / 2.0
     else:
@@ -171,8 +214,13 @@ def apply_sigma_floor(sigma, horizon):
     return max(sigma, floor)
 
 
-def monte_carlo_bucket_probs(consensus, sigma, buckets, n_sims=MC_SIMS):
-    sims = [random.gauss(consensus, sigma) for _ in range(n_sims)]
+def monte_carlo_bucket_probs(consensus, sigma, buckets, n_sims=MC_SIMS, df=5):
+    sims = []
+    for _ in range(n_sims):
+        z = random.gauss(0, 1)
+        v = random.gammavariate(df / 2.0, 2.0)
+        t_sample = z / math.sqrt(v / df)
+        sims.append(consensus + sigma * t_sample)
     bucket_probs = {}
     for bkey, (t_low, t_high) in buckets.items():
         count = 0
@@ -236,12 +284,18 @@ def run_backtest(days=30, city_filter=None):
         actuals = fetch_historical_actuals(loc, start_str, end_str)
         ecmwf = fetch_historical_ecmwf(loc, start_str, end_str)
         gfs = fetch_historical_gfs(loc, start_str, end_str)
+        icon = fetch_historical_icon(loc, start_str, end_str)
 
         if not actuals:
             print(f"  {C.YELLOW}⚠ No actual data for {loc['name']}{C.RESET}")
             continue
 
-        fetched_dates = sorted(set(actuals.keys()) & set(ecmwf.keys() if ecmwf else set()) & set(gfs.keys() if gfs else set()))
+        # Require at least 2 of 3 forecast models
+        all_forecast_dates = set()
+        for src in [ecmwf, gfs, icon]:
+            if src:
+                all_forecast_dates |= set(src.keys())
+        fetched_dates = sorted(set(actuals.keys()) & all_forecast_dates)
 
         if not fetched_dates:
             print(f"  {C.YELLOW}⚠ No overlapping forecast+actual data for {loc['name']}{C.RESET}")
@@ -254,16 +308,21 @@ def run_backtest(days=30, city_filter=None):
             actual = actuals.get(date_str)
             ecmwf_temp = ecmwf.get(date_str) if ecmwf else None
             gfs_temp = gfs.get(date_str) if gfs else None
+            icon_temp = icon.get(date_str) if icon else None
 
-            if actual is None or (ecmwf_temp is None and gfs_temp is None):
+            if actual is None or (ecmwf_temp is None and gfs_temp is None and icon_temp is None):
                 continue
 
-            # Simulate different horizons
-            # Historical forecast API returns the "best available" forecast
-            # We approximate D+0 for simplicity (conservative — real D+1/D+2 would be worse)
+            # Compute pseudo-ensemble std from model spread (no historical ensemble API)
+            model_temps = [t for t in [ecmwf_temp, gfs_temp, icon_temp] if t is not None]
+            pseudo_ens_std = statistics.stdev(model_temps) if len(model_temps) > 1 else None
+            pseudo_ens_mean = statistics.mean(model_temps) if model_temps else None
+
             horizon = 0  # Historical forecasts are roughly D+0 quality
 
-            consensus, sigma, spread = compute_consensus(ecmwf_temp, gfs_temp)
+            consensus, sigma, spread = compute_consensus(
+                ecmwf_temp, gfs_temp, icon_temp,
+                pseudo_ens_mean, pseudo_ens_std, city_slug)
             if consensus is None:
                 continue
 
@@ -477,13 +536,68 @@ def run_backtest(days=30, city_filter=None):
     print()
 
 
+def compute_biases(days=30):
+    """Compute per-city per-model signed bias (forecast - actual) for bias correction."""
+    print(f"\n{C.BOLD}{C.CYAN}═══ COMPUTING PER-CITY BIASES — {days} DAYS ═══{C.RESET}\n")
+
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days + 1)
+    end = today - timedelta(days=1)
+    start_str, end_str = start.isoformat(), end.isoformat()
+
+    biases = {}
+
+    for city_slug, loc in LOCATIONS.items():
+        actuals = fetch_historical_actuals(loc, start_str, end_str)
+        ecmwf = fetch_historical_ecmwf(loc, start_str, end_str)
+        gfs = fetch_historical_gfs(loc, start_str, end_str)
+        icon = fetch_historical_icon(loc, start_str, end_str)
+
+        if not actuals:
+            continue
+
+        errors = {"ecmwf": [], "gfs": [], "icon": []}
+        for d in sorted(actuals.keys()):
+            actual = actuals[d]
+            if actual is None:
+                continue
+            if ecmwf and d in ecmwf and ecmwf[d] is not None:
+                errors["ecmwf"].append(ecmwf[d] - actual)
+            if gfs and d in gfs and gfs[d] is not None:
+                errors["gfs"].append(gfs[d] - actual)
+            if icon and d in icon and icon[d] is not None:
+                errors["icon"].append(icon[d] - actual)
+
+        city_bias = {}
+        for model, errs in errors.items():
+            if len(errs) >= 5:
+                mean_bias = round(statistics.mean(errs), 2)
+                if abs(mean_bias) >= 0.3:  # Only correct meaningful biases
+                    city_bias[model] = mean_bias
+
+        if city_bias:
+            biases[city_slug] = city_bias
+            print(f"  {loc['name']:<12} {city_bias}")
+        else:
+            print(f"  {loc['name']:<12} {C.DIM}(no significant bias){C.RESET}")
+
+    print(f"\n{C.BOLD}Copy this into bot_v3.py and backtest.py:{C.RESET}\n")
+    print(f"CITY_BIASES = {json.dumps(biases, indent=4)}")
+    print()
+    return biases
+
+
 def main():
     parser = argparse.ArgumentParser(description="Weather Bot Backtest")
     parser.add_argument("--days", type=int, default=30, help="Number of days to backtest (default: 30)")
     parser.add_argument("--city", type=str, default=None, help="Single city to test (e.g., seoul)")
+    parser.add_argument("--compute-biases", action="store_true", help="Compute per-city forecast biases")
     args = parser.parse_args()
 
-    run_backtest(days=args.days, city_filter=args.city)
+    if args.compute_biases:
+        compute_biases(days=args.days)
+    else:
+        run_backtest(days=args.days, city_filter=args.city)
 
 
 if __name__ == "__main__":

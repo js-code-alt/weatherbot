@@ -18,20 +18,19 @@ import bot_v3
 class TestComputeConsensus(unittest.TestCase):
     """Test weighted consensus calculation across models."""
 
-    def test_all_four_models(self):
+    def test_all_five_models(self):
         ens = {"mean": 72.0, "std": 1.5}
-        consensus, sigma, spread, sources = bot_v3.compute_consensus(70.0, 74.0, 71.0, ens)
-        # ECMWF=70*0.35 + GFS=74*0.25 + NWS=71*0.20 + ENS=72*0.20 = 71.6
-        self.assertAlmostEqual(consensus, 71.6, places=1)
-        self.assertEqual(len(sources), 4)
+        consensus, sigma, spread, sources = bot_v3.compute_consensus(70.0, 74.0, 71.0, 71.5, ens)
+        # ECMWF=70*0.30 + GFS=74*0.20 + NWS=71*0.15 + ICON=71.5*0.15 + ENS=72*0.20
+        expected = (70.0*0.30 + 74.0*0.20 + 71.0*0.15 + 71.5*0.15 + 72.0*0.20)
+        self.assertAlmostEqual(consensus, round(expected, 1), places=1)
+        self.assertEqual(len(sources), 5)
         self.assertAlmostEqual(spread, 4.0)  # 74-70
-        self.assertAlmostEqual(sigma, 1.5)   # uses ensemble std
 
     def test_two_models_only(self):
-        consensus, sigma, spread, sources = bot_v3.compute_consensus(70.0, 74.0, None, None)
-        # Weights: ECMWF=0.35, GFS=0.25, total=0.60
-        # (70*0.35 + 74*0.25) / 0.60 = (24.5+18.5)/0.60 = 71.67
-        expected = (70.0 * 0.35 + 74.0 * 0.25) / 0.60
+        consensus, sigma, spread, sources = bot_v3.compute_consensus(70.0, 74.0, None, None, None)
+        # Weights: ECMWF=0.30, GFS=0.20, total=0.50
+        expected = (70.0 * 0.30 + 74.0 * 0.20) / 0.50
         self.assertAlmostEqual(consensus, round(expected, 1), places=1)
         self.assertEqual(len(sources), 2)
         self.assertAlmostEqual(spread, 4.0)
@@ -39,49 +38,70 @@ class TestComputeConsensus(unittest.TestCase):
         self.assertAlmostEqual(sigma, 2.0)
 
     def test_single_model(self):
-        consensus, sigma, spread, sources = bot_v3.compute_consensus(75.0, None, None, None)
+        consensus, sigma, spread, sources = bot_v3.compute_consensus(75.0, None, None, None, None)
         self.assertAlmostEqual(consensus, 75.0)
         self.assertEqual(spread, 0)
         self.assertEqual(sigma, 2.0)  # default fallback
         self.assertEqual(len(sources), 1)
 
     def test_no_models(self):
-        consensus, sigma, spread, sources = bot_v3.compute_consensus(None, None, None, None)
+        consensus, sigma, spread, sources = bot_v3.compute_consensus(None, None, None, None, None)
         self.assertIsNone(consensus)
         self.assertIsNone(sigma)
         self.assertEqual(sources, {})
 
     def test_ensemble_only(self):
         ens = {"mean": 68.0, "std": 2.3}
-        consensus, sigma, spread, sources = bot_v3.compute_consensus(None, None, None, ens)
+        consensus, sigma, spread, sources = bot_v3.compute_consensus(None, None, None, None, ens)
         self.assertAlmostEqual(consensus, 68.0)
         self.assertAlmostEqual(sigma, 2.3)
         self.assertEqual(len(sources), 1)
 
     def test_weight_redistribution(self):
-        """When NWS is missing, its 20% should be redistributed proportionally."""
+        """When NWS and ICON are missing, weights should be redistributed proportionally."""
         ens = {"mean": 72.0, "std": 1.0}
-        consensus, _, _, sources = bot_v3.compute_consensus(70.0, 74.0, None, ens)
-        # Available: ECMWF(0.35) + GFS(0.25) + ENS(0.20) = 0.80
-        expected = (70.0*0.35 + 74.0*0.25 + 72.0*0.20) / 0.80
+        consensus, _, _, sources = bot_v3.compute_consensus(70.0, 74.0, None, None, ens)
+        # Available: ECMWF(0.30) + GFS(0.20) + ENS(0.20) = 0.70
+        expected = (70.0*0.30 + 74.0*0.20 + 72.0*0.20) / 0.70
         self.assertAlmostEqual(consensus, round(expected, 1), places=1)
         self.assertNotIn("nws", sources)
+        self.assertNotIn("icon", sources)
+
+    def test_bias_correction(self):
+        """Per-city bias should be subtracted from model temps."""
+        original_biases = bot_v3.CITY_BIASES.copy()
+        bot_v3.CITY_BIASES["test_city"] = {"ecmwf": 2.0, "gfs": -1.0}
+        try:
+            # ecmwf=72 corrected to 70, gfs=73 corrected to 74
+            consensus, _, _, _ = bot_v3.compute_consensus(72.0, 73.0, None, None, None, city_slug="test_city")
+            expected = (70.0 * 0.30 + 74.0 * 0.20) / 0.50
+            self.assertAlmostEqual(consensus, round(expected, 1), places=1)
+        finally:
+            bot_v3.CITY_BIASES = original_biases
+
+    def test_sigma_blending(self):
+        """Sigma should blend ensemble std with model spread."""
+        ens = {"mean": 72.0, "std": 1.0}
+        _, sigma, spread, _ = bot_v3.compute_consensus(70.0, 74.0, None, 72.0, ens)
+        # spread = 4, model_sigma = 2.0, ens_sigma = 1.0
+        # blended = 0.7 * 1.0 + 0.3 * 2.0 = 1.3
+        self.assertAlmostEqual(sigma, 1.3, places=1)
 
 
 class TestSigmaFloor(unittest.TestCase):
     """Test sigma floor application by forecast horizon."""
 
     def test_today_floor(self):
-        self.assertEqual(bot_v3.apply_sigma_floor(0.5, 0), 0.8)
+        self.assertEqual(bot_v3.apply_sigma_floor(0.5, 0), 1.3)
 
     def test_tomorrow_floor(self):
-        self.assertEqual(bot_v3.apply_sigma_floor(0.5, 1), 1.2)
+        self.assertEqual(bot_v3.apply_sigma_floor(0.5, 1), 1.7)
 
     def test_sigma_above_floor(self):
         self.assertEqual(bot_v3.apply_sigma_floor(3.0, 0), 3.0)
 
     def test_day3_floor(self):
-        self.assertEqual(bot_v3.apply_sigma_floor(1.0, 3), 2.5)
+        self.assertEqual(bot_v3.apply_sigma_floor(1.0, 3), 2.9)
 
     def test_unknown_horizon(self):
         # days_out > 4 falls back to 3.0
