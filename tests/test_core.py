@@ -92,7 +92,7 @@ class TestSigmaFloor(unittest.TestCase):
     """Test sigma floor application by forecast horizon."""
 
     def test_today_floor(self):
-        self.assertEqual(bot_v3.apply_sigma_floor(0.5, 0), 1.3)
+        self.assertEqual(bot_v3.apply_sigma_floor(0.5, 0), 3.0)
 
     def test_tomorrow_floor(self):
         self.assertEqual(bot_v3.apply_sigma_floor(0.5, 1), 1.7)

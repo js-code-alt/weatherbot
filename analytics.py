@@ -22,7 +22,7 @@ from urllib.error import URLError
 LOG_FILE = Path("logs/weather-signals.ndjson")
 
 # Current sigma floors from bot_v3.py
-SIGMA_FLOORS = {0: 1.3, 1: 1.5, 2: 1.8, 3: 2.5, 4: 3.0}
+SIGMA_FLOORS = {0: 3.0, 1: 1.7, 2: 2.2, 3: 2.9, 4: 3.2}
 
 # Locations from bot_v3.py
 LOCATIONS = {
