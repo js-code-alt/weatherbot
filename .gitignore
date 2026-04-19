@@ -213,4 +213,5 @@ polymarket_backtest/events.jsonl
 polymarket_backtest/markets.jsonl
 polymarket_backtest/*.csv
 polymarket_backtest/*.xz
+polymarket_backtest/*.db
 polymarket_backtest/prices/

@@ -5,7 +5,7 @@ Historical backtesting of the weather bot against real Polymarket prices.
 ## Status
 
 - [x] Phase 1: Survey coverage — done
-- [ ] Phase 2: Download full price histories for events
+- [x] Phase 2: Download full price histories — done (1.6M price points, 327 MB SQLite)
 - [ ] Phase 3: Historical forecast reconstruction (via Open-Meteo archive API)
 - [ ] Phase 4: Simulate bot decisions against real prices + compute P&L
 
@@ -36,4 +36,33 @@ Historical backtesting of the weather bot against real Polymarket prices.
 ## Files
 
 - `fetch_weather_markets.py` — Phase 1 event fetcher
-- `events.jsonl` — 316 events with metadata + markets + current prices
+- `download_prices.py` — Phase 2 price history downloader
+- `events.jsonl` — 316 events with metadata + markets (gitignored)
+- `prices.db` — SQLite: markets + 1.6M price points (gitignored, 327 MB)
+
+## Phase 2 results
+
+- **3,476 YES tokens** downloaded (NO tokens skipped — complementary)
+- **1,645,880 price points** (avg ~470 per market)
+- **100% bucket parsing** success from question text
+- **316 winning buckets** (exactly 1 per event, as expected)
+- Zero fetch errors
+
+## Schema
+
+```sql
+markets (
+    token_id TEXT PRIMARY KEY,
+    event_slug, event_date, city,
+    question, condition_id,
+    outcome,                    -- "Yes" or "No"
+    bucket_low, bucket_high,    -- parsed temp range (°F)
+    final_price,                -- 0 or 1 (resolution)
+    volume, closed
+)
+
+prices (
+    token_id, ts, p,            -- unix ts, price
+    PRIMARY KEY (token_id, ts)
+)
+```
