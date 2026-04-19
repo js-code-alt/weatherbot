@@ -207,3 +207,10 @@ marimo/_lsp/
 __marimo__/
 .DS_Store
 logs/*.ndjson
+
+# Polymarket backtest data
+polymarket_backtest/events.jsonl
+polymarket_backtest/markets.jsonl
+polymarket_backtest/*.csv
+polymarket_backtest/*.xz
+polymarket_backtest/prices/
