@@ -13,7 +13,7 @@
   "vc_key": "YOUR_KEY_HERE",
   "max_slippage": 0.03,
   "min_edge": 0.05,
-  "single_min_edge": 0.15,
+  "single_min_edge": 0.25,
   "ladder_budget": 0.25,
   "mc_sims": 10000,
   "max_ladder_rungs": 5,
