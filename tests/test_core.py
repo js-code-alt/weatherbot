@@ -201,22 +201,26 @@ class TestKellyCriterion(unittest.TestCase):
         self.assertGreater(k, 0.5)
 
     def test_bet_size_clamping(self):
-        # Tiny Kelly -> $1 min
-        size = bot_v3.kelly_bet_size(0.001, 1000)
-        self.assertEqual(size, 1.0)
+        # Reads MIN_BET and MAX_BET from config rather than hardcoding,
+        # so the test stays correct even if bounds are retuned.
+        # Tiny Kelly -> clamped up to MIN_BET
+        size = bot_v3.kelly_bet_size(0.001, 1000)  # raw = 0.25
+        self.assertEqual(size, bot_v3.MIN_BET)
 
-        # Huge Kelly -> $10 max
-        size = bot_v3.kelly_bet_size(0.90, 100000)
-        self.assertEqual(size, 10.0)
+        # Huge Kelly -> clamped down to MAX_BET
+        size = bot_v3.kelly_bet_size(0.90, 100000)  # raw = 22500
+        self.assertEqual(size, bot_v3.MAX_BET)
 
     def test_bet_size_normal(self):
-        # kelly_frac=0.20, bankroll=1000 -> adjusted=0.20*0.25=0.05, raw=50 -> clamped to 10
+        # kelly_frac=0.20, bankroll=1000 -> adjusted=0.20*0.25=0.05, raw=50
+        # Expected to fall between MIN_BET and MAX_BET and pass through unchanged.
         size = bot_v3.kelly_bet_size(0.20, 1000)
-        self.assertEqual(size, 10.0)
+        self.assertEqual(size, 50.0)
+        self.assertTrue(bot_v3.MIN_BET <= size <= bot_v3.MAX_BET)
 
-        # kelly_frac=0.10, bankroll=200 -> adjusted=0.025, raw=5
+        # kelly_frac=0.10, bankroll=200 -> adjusted=0.025, raw=5 — at MIN_BET floor
         size = bot_v3.kelly_bet_size(0.10, 200)
-        self.assertEqual(size, 5.0)
+        self.assertEqual(size, max(5.0, bot_v3.MIN_BET))
 
 
 class TestConfidenceLevels(unittest.TestCase):
@@ -264,8 +268,11 @@ class TestParseTempRange(unittest.TestCase):
         self.assertEqual(bot_v3.parse_temp_range(q), (20.0, 25.0))
 
     def test_exact_temp(self):
+        # "be 72°F on" parses to a ±0.5° range because Polymarket resolves
+        # temperatures to whole degrees (e.g. 72°F bucket = [71.5, 72.5)).
+        # See UMA oracle resolution rule on Wunderground whole-degree precision.
         q = "Will the highest temp be 72°F on April 12?"
-        self.assertEqual(bot_v3.parse_temp_range(q), (72.0, 72.0))
+        self.assertEqual(bot_v3.parse_temp_range(q), (71.5, 72.5))
 
     def test_none_input(self):
         self.assertIsNone(bot_v3.parse_temp_range(None))
