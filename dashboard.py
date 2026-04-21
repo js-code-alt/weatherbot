@@ -6,7 +6,7 @@ Usage: python dashboard.py
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SIM_FILE = "simulation_v3.json"
@@ -322,10 +322,8 @@ def signals_section():
 def next_scan_str():
     """Calculate time until next hourly cron scan (runs at :00)."""
     now = datetime.now(timezone.utc)
-    # Next full hour
-    next_hour = now.replace(minute=0, second=0, microsecond=0)
-    if next_hour <= now:
-        next_hour = next_hour.replace(hour=next_hour.hour + 1)
+    # Next full hour — use timedelta to handle 23:xx → 00:xx day rollover
+    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
     delta = next_hour - now
     mins = int(delta.total_seconds() / 60)
     if mins <= 1:
