@@ -31,8 +31,9 @@ with open("config.json") as f:
 
 BANKROLL        = _cfg.get("balance", 10000.0)
 MIN_EDGE        = _cfg.get("min_edge", 0.05)        # 5% min edge for ladder rungs
-SINGLE_MIN_EDGE = _cfg.get("single_min_edge", 0.15)  # 15% min edge for single bets
-MAX_PRICE       = _cfg.get("max_price", 0.45)
+SINGLE_MIN_EDGE = _cfg.get("single_min_edge", 0.15)  # min edge for any rung to trigger
+MAX_PRICE       = _cfg.get("max_price", 0.45)        # don't enter if market already overpriced
+MIN_ENTRY_PRICE = _cfg.get("min_entry_price", 0.05)  # skip penny-priced longshots
 MIN_HOURS       = _cfg.get("min_hours", 2.0)
 MAX_HOURS       = _cfg.get("max_hours", 72.0)
 KELLY_FRACTION  = _cfg.get("kelly_fraction", 0.25)
@@ -450,15 +451,23 @@ def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, mode
     Returns list of ladder rungs sorted by proximity to consensus, or empty list.
     Each rung: {bucket_key, range, model_prob, market_price, edge, kelly, bet_size, ev_per_dollar}
     """
-    # Find all positive-EV buckets with edge >= 5%
+    # Find all positive-EV buckets passing all gates:
+    #   - price in a tradable range (MIN_ENTRY_PRICE ≤ price ≤ MAX_PRICE)
+    #   - edge at least SINGLE_MIN_EDGE (config-driven) AND at least MIN_EDGE (ladder floor)
     candidates = []
     for bkey, prob in bucket_probs.items():
         price = market_prices.get(bkey, 1.0)
         if price <= 0 or price >= 1:
             continue
+        if price < MIN_ENTRY_PRICE:
+            continue  # penny-priced longshots: high variance, small forecast errors dominate
+        if price > MAX_PRICE:
+            continue  # market already overpriced relative to our tolerance
         edge = prob - price
         if edge < MIN_EDGE:
             continue
+        if edge < SINGLE_MIN_EDGE:
+            continue  # config-driven primary edge gate (previously unused bug)
 
         t_low, t_high = buckets[bkey]
         # Distance from consensus to bucket midpoint

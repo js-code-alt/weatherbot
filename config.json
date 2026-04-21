@@ -14,6 +14,7 @@
   "max_slippage": 0.03,
   "min_edge": 0.05,
   "single_min_edge": 0.25,
+  "min_entry_price": 0.05,
   "ladder_budget": 0.25,
   "mc_sims": 10000,
   "max_ladder_rungs": 5,
