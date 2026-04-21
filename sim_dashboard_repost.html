@@ -132,7 +132,7 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 <div class="bot-grid">
   <div class="panel">
     <div class="card-head"><span class="card-title">Trade History</span><span class="card-badge">FROM simulation.json</span></div>
-    <div class="scroll" id="trade-list"><div class="empty">No trades yet — run: python weather_bot_v2.py --live</div></div>
+    <div class="scroll" id="trade-list"><div class="empty">No trades yet — run: python bot_v3.py --live</div></div>
   </div>
   <div class="panel">
     <div class="card-head"><span class="card-title">Kelly + EV Log</span><span class="card-badge">ENTRIES ONLY</span></div>
@@ -141,7 +141,7 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 </div>
 
 <div class="footer">
-  <div class="footer-text">Weather Bot v2 · Reads from simulation.json · Refreshes every 10s</div>
+  <div class="footer-text">Weather Bot v3 · Reads from simulation_v3.json · Refreshes every 10s</div>
   <div class="sim-badge">⚡ $1,000 SIMULATION</div>
 </div>
 </div>
@@ -197,7 +197,7 @@ function renderPositions(positions){
 
 function renderTrades(trades){
   const el=document.getElementById('trade-list');
-  if(!trades||!trades.length){el.innerHTML='<div class="empty">No trades yet — run: python weather_bot_v2.py --live</div>';return;}
+  if(!trades||!trades.length){el.innerHTML='<div class="empty">No trades yet — run: python bot_v3.py --live</div>';return;}
   const recent=[...trades].reverse().slice(0,15);
   el.innerHTML=recent.map(t=>{
     const isEntry=t.type==='entry';
