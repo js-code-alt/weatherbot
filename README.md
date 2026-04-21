@@ -6,23 +6,17 @@ No SDK. No black box. Pure Python.
 
 ---
 
-## Versions
+## Current version: `bot_v3.py`
 
-### `bot_v1.py` — Base Bot
-The foundation. Scans 6 US cities, fetches forecasts from NWS using airport station coordinates, finds matching temperature buckets on Polymarket, and enters trades when the market price is below the entry threshold.
-
-No math, no complexity. Just the core logic — good for understanding how the system works.
-
-### `weatherbet.py` — Full Bot (current)
-Everything in v1, plus:
-- **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
-- **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
-- **Expected Value** — skips trades where the math doesn't work
-- **Kelly Criterion** — sizes positions based on edge strength
-- **Stop-loss + trailing stop** — 20% stop, moves to breakeven at +20%
-- **Slippage filter** — skips markets with spread > $0.03
-- **Self-calibration** — learns forecast accuracy per city over time
-- **Full data storage** — every forecast snapshot, trade, and resolution saved to JSON
+The active bot. Features:
+- **11 cities** (US + international, Seoul disabled pending bias retune)
+- **5 forecast sources** — ECMWF, GFS, ICON, NWS (US), GFS Ensemble (mean + std)
+- **Weighted consensus** — per-city bias correction applied before weighting
+- **Monte Carlo probability engine** — Student's t sampling, sigma-floored by horizon
+- **Quarter-Kelly sizing** — $5–$100 per rung, ladder up to 5 rungs
+- **Edge gates** — SINGLE_MIN_EDGE (default 0.25) + MIN_ENTRY_PRICE (default 0.05)
+- **Take-profit at 75¢** — no stop-loss (removed; binary markets cap downside at stake)
+- **Full data storage** — forecast snapshots, trades, and resolutions logged to NDJSON
 
 ---
 
@@ -92,9 +86,20 @@ Get a free Visual Crossing API key at visualcrossing.com — used to fetch actua
 
 ## Usage
 ```bash
-python weatherbet.py           # start the bot — scans every hour
-python weatherbet.py status    # balance and open positions
-python weatherbet.py report    # full breakdown of all resolved markets
+python bot_v3.py           # paper-trading scan (no trades executed)
+python bot_v3.py --live    # scan and execute trades against virtual balance
+python dashboard.py        # show balance, open positions, recent trades
+python analytics.py all    # calibration + P&L + sigma floor analysis
+python backtest.py         # 30-day historical calibration backtest
+```
+
+Polymarket backtest framework (optional, heavier):
+```bash
+cd polymarket_backtest
+python fetch_weather_markets.py --days 30
+python download_prices.py
+python reconstruct_forecasts.py
+python simulate_bot.py --mode noisy --edge 0.25
 ```
 
 ---

@@ -222,3 +222,4 @@ claudedocs/package*.json
 claudedocs/*.docx
 polymarket_backtest/events_30d.jsonl
 polymarket_backtest/events_*d.jsonl
+claudedocs/
