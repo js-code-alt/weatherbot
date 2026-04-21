@@ -81,10 +81,12 @@ def monte_carlo_bucket_prob(consensus, sigma, bucket_low, bucket_high, n_sims=50
 
 
 class Simulation:
-    def __init__(self, db_path, mode="hindsight", edge_threshold=0.15, seed=42, noise_std=REAL_FORECAST_NOISE_STD):
+    def __init__(self, db_path, mode="hindsight", edge_threshold=0.15,
+                 min_entry_price=0.0, seed=42, noise_std=REAL_FORECAST_NOISE_STD):
         self.con = sqlite3.connect(db_path)
         self.mode = mode
         self.edge_threshold = edge_threshold
+        self.min_entry_price = min_entry_price
         self.noise_std = noise_std
         random.seed(seed)
         self.bankroll = START_BANKROLL
@@ -194,6 +196,9 @@ class Simulation:
             # Don't enter at prices already at/above TP — no room to profit
             if price >= TAKE_PROFIT:
                 continue
+            # Apply configured MIN_ENTRY_PRICE floor (penny-longshot filter)
+            if price < self.min_entry_price:
+                continue
 
             bp = bot_probs.get(tok)
             if bp is None or bp <= price:
@@ -291,6 +296,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["hindsight", "noisy"], default="hindsight")
     ap.add_argument("--edge", type=float, default=0.15)
+    ap.add_argument("--min-entry-price", type=float, default=0.0,
+                    help="Skip markets below this price (penny-longshot filter)")
     ap.add_argument("--city", type=str, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--noise-std", type=float, default=REAL_FORECAST_NOISE_STD,
@@ -298,6 +305,7 @@ def main():
     args = ap.parse_args()
 
     sim = Simulation(DB_PATH, mode=args.mode, edge_threshold=args.edge,
+                     min_entry_price=args.min_entry_price,
                      seed=args.seed, noise_std=args.noise_std)
     sim.run(city_filter=args.city)
     sim.report()

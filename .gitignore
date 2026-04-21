@@ -215,3 +215,10 @@ polymarket_backtest/*.csv
 polymarket_backtest/*.xz
 polymarket_backtest/*.db
 polymarket_backtest/prices/
+
+# Backup/dev artifacts
+claudedocs/node_modules/
+claudedocs/package*.json
+claudedocs/*.docx
+polymarket_backtest/events_30d.jsonl
+polymarket_backtest/events_*d.jsonl

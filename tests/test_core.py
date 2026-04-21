@@ -342,6 +342,36 @@ class TestBuildLadder(unittest.TestCase):
             # 70-75 has edge=0.55, 75-80 has edge=0.25 -> 70-75 should get more
             self.assertGreaterEqual(ladder[0]["bet_size"], ladder[1]["bet_size"])
 
+    def test_min_entry_price_filter(self):
+        """Penny-priced longshots should be filtered by MIN_ENTRY_PRICE."""
+        # bot_prob=0.30, market=$0.01 → edge=0.29 (strongly passes edge gate)
+        # BUT price=0.01 < MIN_ENTRY_PRICE=0.05 → should be filtered
+        probs = {"70-75": 0.30}
+        prices = {"70-75": 0.01}
+        buckets = {"70-75": (70, 75)}
+        ladder = bot_v3.build_ladder(buckets, probs, prices, 72.5, 10000, 1.0)
+        self.assertEqual(len(ladder), 0,
+                         "penny-priced longshot should be blocked by MIN_ENTRY_PRICE")
+
+    def test_min_entry_price_boundary(self):
+        """A bucket priced exactly at MIN_ENTRY_PRICE should still be accepted."""
+        probs = {"70-75": 0.40}
+        prices = {"70-75": bot_v3.MIN_ENTRY_PRICE}  # exactly at floor
+        buckets = {"70-75": (70, 75)}
+        ladder = bot_v3.build_ladder(buckets, probs, prices, 72.5, 10000, 1.0)
+        self.assertEqual(len(ladder), 1, "price == MIN_ENTRY_PRICE should pass")
+
+    def test_single_min_edge_gate(self):
+        """Edge below SINGLE_MIN_EDGE should be filtered even with tradable price."""
+        # Edge = 0.20-0.10 = 0.10, below default SINGLE_MIN_EDGE of 0.25
+        probs = {"70-75": 0.20}
+        prices = {"70-75": 0.10}
+        buckets = {"70-75": (70, 75)}
+        ladder = bot_v3.build_ladder(buckets, probs, prices, 72.5, 10000, 1.0)
+        if bot_v3.SINGLE_MIN_EDGE >= 0.10:
+            self.assertEqual(len(ladder), 0,
+                             "edge below SINGLE_MIN_EDGE should be blocked")
+
 
 class TestHoursUntilResolution(unittest.TestCase):
 
