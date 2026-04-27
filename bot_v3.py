@@ -69,6 +69,15 @@ LOG_FILE = LOG_DIR / "weather-signals.ndjson"
 # Sigma floors by forecast horizon (days out)
 SIGMA_FLOORS = {0: 3.0, 1: 1.7, 2: 2.2, 3: 2.9, 4: 3.2}
 
+# Thesis-break exit thresholds.
+# Triggered during the main scan when we have a fresh model_prob for an open
+# position's market. Exits at the current market price (a partial recovery beats
+# riding to a near-certain loss).
+THESIS_SOURCE_DROP        = 2     # exit if entry-source count drops by ≥ this
+THESIS_MIN_ENTRY_SOURCES  = 3     # only apply source rule if entry had ≥ this
+THESIS_MODEL_PROB_DROP    = 0.10  # exit if current model_prob falls ≥ this from entry
+THESIS_MIN_EDGE           = 0.15  # exit if current edge (model_prob - market_price) drops below this
+
 # =============================================================================
 # LOCATIONS — Airport stations matching Polymarket resolution
 # =============================================================================
@@ -696,6 +705,99 @@ def check_exits(sim):
     sim["peak_balance"] = max(sim.get("peak_balance", balance), balance)
     return sim, n_closed
 
+
+def evaluate_thesis_break(pos, current_sources, current_model_prob, current_market_price):
+    """Decide whether an open position's original thesis has broken.
+
+    Returns (reason, detail) or (None, None). Reasons:
+      - "source_degradation": forecasts we relied on at entry are no longer available
+      - "model_decay":        model_prob has dropped meaningfully since entry
+      - "edge_collapse":      current edge has fallen below our LOW threshold
+    """
+    entry_sources = pos.get("entry_sources") or []
+    entry_prob = pos.get("model_prob")
+
+    if isinstance(entry_sources, list) and len(entry_sources) >= THESIS_MIN_ENTRY_SOURCES:
+        missing = len(entry_sources) - len(current_sources)
+        if missing >= THESIS_SOURCE_DROP:
+            dropped = sorted(set(entry_sources) - set(current_sources))
+            return ("source_degradation", f"-{missing} sources ({','.join(dropped)})")
+
+    if entry_prob is not None:
+        prob_drop = entry_prob - current_model_prob
+        if prob_drop >= THESIS_MODEL_PROB_DROP:
+            return ("model_decay", f"prob {entry_prob:.1%} → {current_model_prob:.1%}")
+
+    current_edge = current_model_prob - current_market_price
+    if current_edge < THESIS_MIN_EDGE:
+        return ("edge_collapse", f"edge {current_edge:+.1%}")
+
+    return (None, None)
+
+
+def apply_thesis_break_exits(sim, balance, sources, bucket_probs, market_prices, market_ids):
+    """Inspect open positions whose markets appear in this scan and close any
+    where the original thesis has broken. Returns (sim, balance, n_closed)."""
+    n_closed = 0
+    current_sources = list(sources.keys()) if sources else []
+
+    for bkey, prob in bucket_probs.items():
+        mid = market_ids.get(bkey, "")
+        if not mid or mid not in sim["positions"]:
+            continue
+        price = market_prices.get(bkey)
+        if price is None or price <= 0 or price >= 1:
+            continue
+
+        pos = sim["positions"][mid]
+        reason, detail = evaluate_thesis_break(pos, current_sources, prob, price)
+        if not reason:
+            continue
+
+        entry = pos["entry_price"]
+        cost = pos["cost"]
+        shares = pos["shares"]
+        proceeds = round(shares * price, 2)
+        pnl = round(proceeds - cost, 2)
+        balance += proceeds
+
+        if pnl >= 0:
+            sim["wins"] += 1
+        else:
+            sim["losses"] += 1
+
+        color = C.GREEN if pnl >= 0 else C.RED
+        ok(f"THESIS BREAK ({reason}): {pos['question'][:50]}... | "
+           f"${entry:.3f}→${price:.3f} | {color}{'+'if pnl>=0 else ''}{pnl:.2f}{C.RESET} | {detail}")
+
+        log_signal({
+            "type": "thesis_break",
+            "reason": reason,
+            "detail": detail,
+            "city": pos.get("city", ""),
+            "date": pos.get("date", ""),
+            "question": pos["question"],
+            "entry_price": entry,
+            "exit_price": price,
+            "entry_model_prob": pos.get("model_prob"),
+            "current_model_prob": prob,
+            "entry_sources": pos.get("entry_sources"),
+            "current_sources": current_sources,
+            "pnl": pnl,
+            "market_id": mid,
+        })
+        sim["trades"].append({
+            "type": "exit", "reason": f"thesis_break:{reason}",
+            "question": pos["question"],
+            "entry_price": entry, "exit_price": price,
+            "pnl": pnl, "closed_at": datetime.now().isoformat(),
+        })
+        del sim["positions"][mid]
+        n_closed += 1
+
+    sim["balance"] = round(balance, 2)
+    return sim, balance, n_closed
+
 # =============================================================================
 # SHOW POSITIONS
 # =============================================================================
@@ -843,6 +945,12 @@ def run(dry_run=True):
             bucket_probs = monte_carlo_bucket_probs(
                 consensus, sigma, buckets)
 
+            # Thesis-break exits: close any open position on these markets
+            # whose original entry thesis no longer holds.
+            if not dry_run:
+                sim, balance, _ = apply_thesis_break_exits(
+                    sim, balance, sources, bucket_probs, market_prices, market_ids)
+
             # Build ladder
             ladder = build_ladder(
                 buckets, bucket_probs, market_prices,
@@ -941,6 +1049,7 @@ def run(dry_run=True):
                         "edge": rung["edge"],
                         "horizon": day_offset,
                         "bucket": bkey,
+                        "entry_sources": list(sources.keys()),
                         "opened_at": datetime.now().isoformat(),
                     }
                     sim["total_trades"] += 1
