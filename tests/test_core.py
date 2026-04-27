@@ -492,5 +492,118 @@ class TestLogSignal(unittest.TestCase):
         self.assertEqual(entry2["type"], "ladder")
 
 
+class TestThesisBreakExit(unittest.TestCase):
+    """Verify thesis-break exit rules: source degradation, model decay, edge collapse."""
+
+    def _pos(self, **overrides):
+        base = {
+            "question": "Will Chicago be 72F or higher on April 27?",
+            "entry_price": 0.18,
+            "shares": 555.56,
+            "cost": 100.0,
+            "date": "2026-04-27",
+            "city": "chicago",
+            "consensus_temp": 72.7,
+            "model_prob": 0.5825,
+            "model_spread": 11.15,
+            "sigma_used": 3.41,
+            "confidence": "MEDIUM",
+            "edge": 0.4025,
+            "horizon": 2,
+            "bucket": "72.0-999.0",
+            "entry_sources": ["ecmwf", "gfs", "nws", "icon", "ensemble"],
+        }
+        base.update(overrides)
+        return base
+
+    def test_source_degradation_triggers(self):
+        # Entry had 5 sources, current scan only NWS+ENS — drop of 3 ≥ THESIS_SOURCE_DROP
+        reason, _ = bot_v3.evaluate_thesis_break(
+            self._pos(), current_sources=["nws", "ensemble"],
+            current_model_prob=0.45, current_market_price=0.10)
+        self.assertEqual(reason, "source_degradation")
+
+    def test_source_drop_below_threshold_does_not_trigger(self):
+        # Drop of 1 is below THESIS_SOURCE_DROP=2, and model_prob/edge still healthy
+        reason, _ = bot_v3.evaluate_thesis_break(
+            self._pos(), current_sources=["ecmwf", "gfs", "nws", "ensemble"],
+            current_model_prob=0.55, current_market_price=0.18)
+        self.assertIsNone(reason)
+
+    def test_low_entry_source_count_skips_source_rule(self):
+        # Entry only had 2 sources — too few to apply source rule reliably
+        pos = self._pos(entry_sources=["nws", "ensemble"], model_prob=0.5)
+        reason, _ = bot_v3.evaluate_thesis_break(
+            pos, current_sources=["nws"],
+            current_model_prob=0.45, current_market_price=0.18)
+        # Should NOT be source_degradation (rule guarded). Edge 0.45-0.18=0.27 OK, prob drop 0.05 OK.
+        self.assertIsNone(reason)
+
+    def test_model_decay_triggers(self):
+        # Same source count, model_prob dropped 15pp (≥ THESIS_MODEL_PROB_DROP=10pp)
+        reason, _ = bot_v3.evaluate_thesis_break(
+            self._pos(), current_sources=["ecmwf", "gfs", "nws", "icon", "ensemble"],
+            current_model_prob=0.43, current_market_price=0.18)
+        self.assertEqual(reason, "model_decay")
+
+    def test_edge_collapse_triggers(self):
+        # Sources fine, model_prob barely moved (entry 58.25 → 50, drop 8pp < 10pp gate),
+        # but edge has collapsed: 0.50 - 0.40 = 0.10 < THESIS_MIN_EDGE
+        reason, _ = bot_v3.evaluate_thesis_break(
+            self._pos(model_prob=0.50),
+            current_sources=["ecmwf", "gfs", "nws", "icon", "ensemble"],
+            current_model_prob=0.50, current_market_price=0.40)
+        self.assertEqual(reason, "edge_collapse")
+
+    def test_healthy_position_no_exit(self):
+        reason, _ = bot_v3.evaluate_thesis_break(
+            self._pos(), current_sources=["ecmwf", "gfs", "nws", "icon", "ensemble"],
+            current_model_prob=0.60, current_market_price=0.18)
+        self.assertIsNone(reason)
+
+    def test_apply_thesis_break_exits_closes_position_and_logs_pnl(self):
+        sim = {
+            "balance": 8000.0,
+            "wins": 0,
+            "losses": 0,
+            "trades": [],
+            "positions": {
+                "M1": self._pos(),
+            },
+        }
+        sources = {"nws": 70, "ensemble": 71.7}  # 3 sources missing
+        bucket_probs = {"72.0-999.0": 0.43}
+        market_prices = {"72.0-999.0": 0.10}
+        market_ids = {"72.0-999.0": "M1"}
+
+        with patch.object(bot_v3, "log_signal"):
+            sim_out, balance_out, n_closed = bot_v3.apply_thesis_break_exits(
+                sim, 8000.0, sources, bucket_probs, market_prices, market_ids)
+
+        self.assertEqual(n_closed, 1)
+        self.assertNotIn("M1", sim_out["positions"])
+        # Sold 555.56 shares @ 0.10 = 55.56 proceeds, cost was 100 → pnl = -44.44
+        self.assertAlmostEqual(balance_out, 8000.0 + 55.56, places=2)
+        self.assertEqual(sim_out["losses"], 1)
+        self.assertEqual(sim_out["trades"][-1]["reason"], "thesis_break:source_degradation")
+
+    def test_apply_thesis_break_skips_unrelated_markets(self):
+        sim = {
+            "balance": 8000.0, "wins": 0, "losses": 0, "trades": [],
+            "positions": {"M1": self._pos()},
+        }
+        # Position M1 is not in this scan's market_ids (different city/date)
+        with patch.object(bot_v3, "log_signal"):
+            sim_out, balance_out, n_closed = bot_v3.apply_thesis_break_exits(
+                sim, 8000.0,
+                {"ecmwf": 80, "gfs": 81},
+                {"80.0-999.0": 0.6},
+                {"80.0-999.0": 0.3},
+                {"80.0-999.0": "M_OTHER"},
+            )
+        self.assertEqual(n_closed, 0)
+        self.assertIn("M1", sim_out["positions"])
+
+
 if __name__ == "__main__":
     unittest.main()
