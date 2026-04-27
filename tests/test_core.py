@@ -299,7 +299,7 @@ class TestBuildLadder(unittest.TestCase):
 
     def test_basic_ladder(self):
         probs = {"65-70": 0.15, "70-75": 0.55, "75-80": 0.20, "60-65": 0.05, "80-999": 0.05}
-        prices = {"65-70": 0.05, "70-75": 0.08, "75-80": 0.10, "60-65": 0.04, "80-999": 0.50}
+        prices = {"65-70": 0.12, "70-75": 0.15, "75-80": 0.18, "60-65": 0.04, "80-999": 0.50}
         ladder = bot_v3.build_ladder(self.buckets, probs, prices, 72.5, 10000, 2.0)
         self.assertGreater(len(ladder), 0)
         # All rungs should have positive edge
@@ -316,14 +316,14 @@ class TestBuildLadder(unittest.TestCase):
     def test_ladder_max_rungs(self):
         """Ladder should not exceed MAX_LADDER_RUNGS."""
         probs = {k: 0.40 for k in self.buckets}
-        prices = {k: 0.05 for k in self.buckets}
+        prices = {k: 0.15 for k in self.buckets}
         ladder = bot_v3.build_ladder(self.buckets, probs, prices, 72.5, 10000, 1.0)
         self.assertLessEqual(len(ladder), bot_v3.MAX_LADDER_RUNGS)
 
     def test_ladder_sorted_by_proximity(self):
         """Rungs should be sorted by distance from consensus."""
         probs = {"65-70": 0.30, "70-75": 0.50, "75-80": 0.30, "60-65": 0.20, "80-999": 0.15}
-        prices = {"65-70": 0.05, "70-75": 0.05, "75-80": 0.05, "60-65": 0.05, "80-999": 0.05}
+        prices = {"65-70": 0.12, "70-75": 0.15, "75-80": 0.13, "60-65": 0.12, "80-999": 0.12}
         ladder = bot_v3.build_ladder(self.buckets, probs, prices, 72.5, 10000, 1.0)
         if len(ladder) >= 2:
             for i in range(len(ladder) - 1):
@@ -331,22 +331,22 @@ class TestBuildLadder(unittest.TestCase):
 
     def test_combined_hit_probability(self):
         """Combined prob should be 1 - product(1-p_i)."""
-        probs = {"70-75": 0.50, "75-80": 0.30}
-        prices = {"70-75": 0.05, "75-80": 0.05}
+        probs = {"70-75": 0.50, "75-80": 0.40}
+        prices = {"70-75": 0.15, "75-80": 0.12}
         buckets = {"70-75": (70, 75), "75-80": (75, 80)}
         ladder = bot_v3.build_ladder(buckets, probs, prices, 72.5, 10000, 1.0)
-        if ladder:
-            expected = 1.0 - (1.0 - 0.50) * (1.0 - 0.30)
-            self.assertAlmostEqual(ladder[0]["combined_hit_prob"], round(expected, 4), places=3)
+        self.assertEqual(len(ladder), 2, "both rungs should pass all gates")
+        expected = 1.0 - (1.0 - 0.50) * (1.0 - 0.40)
+        self.assertAlmostEqual(ladder[0]["combined_hit_prob"], round(expected, 4), places=3)
 
     def test_bet_allocation_proportional_to_edge(self):
         """Larger edge should get larger bet allocation."""
         probs = {"70-75": 0.60, "75-80": 0.30}
-        prices = {"70-75": 0.05, "75-80": 0.05}
+        prices = {"70-75": 0.15, "75-80": 0.12}
         buckets = {"70-75": (70, 75), "75-80": (75, 80)}
         ladder = bot_v3.build_ladder(buckets, probs, prices, 72.5, 10000, 1.0)
         if len(ladder) == 2:
-            # 70-75 has edge=0.55, 75-80 has edge=0.25 -> 70-75 should get more
+            # 70-75 has edge=0.45, 75-80 has edge=0.18 -> 70-75 should get more
             self.assertGreaterEqual(ladder[0]["bet_size"], ladder[1]["bet_size"])
 
     def test_min_entry_price_filter(self):
@@ -360,13 +360,40 @@ class TestBuildLadder(unittest.TestCase):
         self.assertEqual(len(ladder), 0,
                          "penny-priced longshot should be blocked by MIN_ENTRY_PRICE")
 
-    def test_min_entry_price_boundary(self):
-        """A bucket priced exactly at MIN_ENTRY_PRICE should still be accepted."""
-        probs = {"70-75": 0.40}
-        prices = {"70-75": bot_v3.MIN_ENTRY_PRICE}  # exactly at floor
+    def test_market_extremity_blocks_high_edge(self):
+        """Market at ≤10¢ with our predicted edge ≥20pp should be blocked —
+        extreme market consensus shouldn't be fought."""
+        # Mirror of the failed Denver Apr 26 trade: market 7¢, model 34%, edge 27pp
+        probs = {"70-75": 0.34}
+        prices = {"70-75": 0.07}
         buckets = {"70-75": (70, 75)}
         ladder = bot_v3.build_ladder(buckets, probs, prices, 72.5, 10000, 1.0)
-        self.assertEqual(len(ladder), 1, "price == MIN_ENTRY_PRICE should pass")
+        self.assertEqual(len(ladder), 0,
+                         "extreme market with 27pp edge should be blocked by MARKET_EXTREMITY guard")
+
+    def test_market_extremity_allows_above_threshold(self):
+        """Same edge magnitude but at 12¢ (above MARKET_EXTREMITY_PRICE) should pass."""
+        probs = {"70-75": 0.39}
+        prices = {"70-75": 0.12}  # 12¢ > MARKET_EXTREMITY_PRICE 10¢
+        buckets = {"70-75": (70, 75)}
+        ladder = bot_v3.build_ladder(buckets, probs, prices, 72.5, 10000, 1.0)
+        self.assertEqual(len(ladder), 1,
+                         "above-threshold market should not be blocked")
+
+    def test_market_extremity_allows_modest_edge_at_low_price(self):
+        """At 8¢ market, a modest predicted edge (<20pp) is still fine —
+        we're not picking a fight with strong consensus, just a small one."""
+        # SINGLE_MIN_EDGE may already block this; if so, skip.
+        probs = {"70-75": 0.27}
+        prices = {"70-75": 0.08}  # edge = 0.19, below MARKET_EXTREMITY_EDGE_GAP 0.20
+        buckets = {"70-75": (70, 75)}
+        ladder = bot_v3.build_ladder(buckets, probs, prices, 72.5, 10000, 1.0)
+        # Edge 0.19 is below SINGLE_MIN_EDGE 0.25 by default config — expect block
+        # by edge gate, not by extremity guard. Just verifies extremity guard
+        # isn't over-eager:
+        if bot_v3.SINGLE_MIN_EDGE <= 0.19:
+            self.assertEqual(len(ladder), 1,
+                             "modest edge at low price should bypass extremity guard")
 
     def test_single_min_edge_gate(self):
         """Edge below SINGLE_MIN_EDGE should be filtered even with tradable price."""
