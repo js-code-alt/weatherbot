@@ -46,19 +46,20 @@ SCAN_INTERVAL   = _cfg.get("scan_interval", 3600)
 WEIGHTS = {"ecmwf": 0.30, "gfs": 0.20, "nws": 0.15, "icon": 0.15, "ensemble": 0.20}
 
 # Per-city bias correction (forecast - actual). Subtract from model before consensus.
-# Computed via: python backtest.py --compute-biases (2026-04-13, 30-day window)
+# Computed via: python backtest.py --compute-biases (2026-04-27, 30-day window)
 CITY_BIASES = {
-    "nyc": {"ecmwf": -1.43, "icon": -0.7},
-    "chicago": {"ecmwf": -0.64, "gfs": 2.03, "icon": 0.51},
-    "miami": {"ecmwf": -1.55, "gfs": 0.58, "icon": 1.18},
-    "dallas": {"ecmwf": -0.53, "gfs": 1.07, "icon": 1.4},
-    "seattle": {"ecmwf": -1.02, "icon": -0.48},
-    "atlanta": {"ecmwf": -0.56, "gfs": 1.33},
-    "denver": {"gfs": -1.08, "icon": -0.77},
-    "phoenix": {"icon": 0.53},
-    "london": {"icon": 0.55},
-    "tokyo": {"ecmwf": 0.58, "icon": 1.14},
-    "paris": {"gfs": 0.41, "icon": 0.76},
+    "nyc":     {"ecmwf": -1.38, "gfs": -0.53, "icon": -1.67},
+    "chicago": {"ecmwf": -0.49, "gfs": 1.64,  "icon": 0.7},
+    "miami":   {"ecmwf": -1.63, "gfs": 0.64,  "icon": 1.21},
+    "dallas":  {"ecmwf": -0.55, "gfs": 1.37,  "icon": 1.27},
+    "seattle": {"ecmwf": -1.09, "gfs": 0.63,  "icon": -0.44},
+    "atlanta": {"ecmwf": -0.93, "gfs": 0.35,  "icon": -0.52},
+    "denver":  {"ecmwf": -0.77, "gfs": -1.36, "icon": -1.26},
+    "phoenix": {"ecmwf": -0.32, "icon": 0.34},
+    "tokyo":   {"ecmwf": 0.61,  "gfs": 0.53,  "icon": 1.0},
+    "seoul":   {"ecmwf": -3.07, "gfs": -7.87, "icon": -4.97},  # disabled but kept for backtest
+    "paris":   {"gfs": 0.39,    "icon": 0.91},
+    # london: no significant bias detected
 }
 
 SIM_FILE = "simulation_v3.json"
@@ -77,6 +78,14 @@ THESIS_SOURCE_DROP        = 2     # exit if entry-source count drops by ≥ this
 THESIS_MIN_ENTRY_SOURCES  = 3     # only apply source rule if entry had ≥ this
 THESIS_MODEL_PROB_DROP    = 0.10  # exit if current model_prob falls ≥ this from entry
 THESIS_MIN_EDGE           = 0.15  # exit if current edge (model_prob - market_price) drops below this
+
+# Market-extremity guard: when YES market price is below this AND we claim a
+# large gap to it, treat the extreme price as informed consensus and skip the
+# bet. This catches cases where all forecast models cluster around a wrong
+# answer that the market (with many participants) has already priced against —
+# e.g. a regime-change cold snap nobody's models caught.
+MARKET_EXTREMITY_PRICE    = 0.10  # ≤10¢ counts as an extreme market
+MARKET_EXTREMITY_EDGE_GAP = 0.20  # block when our edge over an extreme market exceeds this
 
 # =============================================================================
 # LOCATIONS — Airport stations matching Polymarket resolution
@@ -477,6 +486,8 @@ def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, mode
             continue
         if edge < SINGLE_MIN_EDGE:
             continue  # config-driven primary edge gate (previously unused bug)
+        if price <= MARKET_EXTREMITY_PRICE and edge >= MARKET_EXTREMITY_EDGE_GAP:
+            continue  # extreme market consensus — don't fight a 10¢ market with a 30% prediction
 
         t_low, t_high = buckets[bkey]
         # Distance from consensus to bucket midpoint
