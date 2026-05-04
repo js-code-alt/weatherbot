@@ -303,19 +303,25 @@ def signals_section():
             pnl_str = fmt_money(pnl)
             print(f"  💰 {colored(ago, C.DIM):>12s}  {city:<10s}  TAKE PROFIT  {pnl_str}")
 
+        elif sig_type == "thesis_break":
+            pnl = sig.get("pnl", 0)
+            reason = sig.get("reason", "thesis")
+            pnl_str = fmt_money(pnl)
+            print(f"  ⚡ {colored(ago, C.DIM):>12s}  {city:<10s}  THESIS {reason[:12]:<12s}  {pnl_str}")
+
         elif sig_type == "stop_loss":
             pnl = sig.get("pnl", 0)
             pnl_str = fmt_money(pnl)
             print(f"  🛑 {colored(ago, C.DIM):>12s}  {city:<10s}  STOP LOSS  {pnl_str}")
 
         elif sig_type == "entry":
-            cost = sig.get("cost", 0)
-            edge = sig.get("edge", 0)
+            cost = sig.get("cost", sig.get("bet_size_usd", 0))
+            edge = sig.get("edge_pct", sig.get("edge", 0))
             print(f"  📥 {colored(ago, C.DIM):>12s}  {city:<10s}  NEW BET  ${cost:.2f}  edge {fmt_edge(edge)}")
 
         else:
-            edge = sig.get("edge", sig.get("best_edge", 0))
-            prob = sig.get("model_prob", sig.get("hit_prob", 0))
+            edge = sig.get("edge_pct", sig.get("edge", sig.get("best_edge", 0)))
+            prob = sig.get("model_probability", sig.get("model_prob", sig.get("hit_prob", 0)))
             if isinstance(prob, (int, float)) and prob > 0:
                 print(f"  🔍 {colored(ago, C.DIM):>12s}  {city:<10s}  SCAN  prob {prob:.0%}  edge {fmt_edge(edge)}")
 

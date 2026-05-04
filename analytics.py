@@ -118,6 +118,23 @@ def temp_in_bucket(temp, bucket_str):
     else:
         return low <= temp <= high
 
+def classify_bucket_type(signal):
+    """Return exact/range/or_higher/or_below for new and legacy logs."""
+    bucket_type = signal.get("bucket_type")
+    if bucket_type:
+        return bucket_type
+
+    low, high = parse_bucket(signal.get("bucket", ""))
+    if low is None:
+        return "unknown"
+    if low <= -900:
+        return "or_below"
+    if high >= 900:
+        return "or_higher"
+    if abs((high - low) - 1.0) < 1e-9:
+        return "exact"
+    return "range"
+
 # ── Calibration Backtest ──
 
 def run_calibration(signals):
@@ -125,7 +142,7 @@ def run_calibration(signals):
     print(f"\n{C.BOLD}{C.CYAN}═══ CALIBRATION BACKTEST ═══{C.RESET}\n")
 
     # Get all edge/ladder signals and resolution signals
-    edge_signals = [s for s in signals if s.get("type") in ("edge", "ladder")]
+    edge_signals = [s for s in signals if s.get("type") in ("edge", "ladder", "entry")]
     resolutions = {s["market_id"]: s for s in signals if s.get("type") == "resolution"}
 
     if not resolutions:
@@ -143,6 +160,7 @@ def run_calibration(signals):
 
     # Build calibration data: predicted probability vs actual outcome
     bins = defaultdict(lambda: {"count": 0, "hits": 0, "probs": []})
+    bucket_type_bins = defaultdict(lambda: {"count": 0, "hits": 0, "probs": []})
 
     matched = 0
     for mid, resolution in resolutions.items():
@@ -169,6 +187,13 @@ def run_calibration(signals):
         bins[bin_key]["count"] += 1
         bins[bin_key]["hits"] += 1 if hit else 0
         bins[bin_key]["probs"].append(model_prob)
+
+        bucket_type = classify_bucket_type(edge)
+        if bucket_type == "unknown":
+            bucket_type = classify_bucket_type(resolution)
+        bucket_type_bins[bucket_type]["count"] += 1
+        bucket_type_bins[bucket_type]["hits"] += 1 if hit else 0
+        bucket_type_bins[bucket_type]["probs"].append(model_prob)
 
     print(f"  Matched {matched} resolved signals to edge predictions\n")
 
@@ -222,6 +247,18 @@ def run_calibration(signals):
         print(f"  {C.GREEN}✅ Model appears well-calibrated (or underconfident — good){C.RESET}")
     else:
         print(f"  {C.RED}⚠ Model may be overconfident — review sigma floors{C.RESET}")
+
+    print(f"\n  {C.BOLD}By Bucket Type{C.RESET}\n")
+    print(f"  {'Bucket Type':<13} {'Signals':>8} {'Hits':>6} {'Actual':>8} {'Predicted':>10}")
+    print(f"  {'─'*52}")
+    for bucket_type in ["exact", "range", "or_higher", "or_below", "unknown"]:
+        data = bucket_type_bins[bucket_type]
+        if data["count"] == 0:
+            continue
+        actual_rate = data["hits"] / data["count"]
+        predicted_rate = statistics.mean(data["probs"]) if data["probs"] else 0
+        print(f"  {bucket_type:<13} {data['count']:>8} {data['hits']:>6} "
+              f"{actual_rate:>7.1%} {predicted_rate:>9.1%}")
 
 # ── Sigma Analysis ──
 
@@ -423,8 +460,9 @@ def run_pnl(signals):
     """Break down P&L by confidence tier and horizon."""
     print(f"\n{C.BOLD}{C.CYAN}═══ P&L BREAKDOWN ═══{C.RESET}\n")
 
-    # Collect all exit signals (resolution, stop_loss, take_profit)
-    exits = [s for s in signals if s.get("type") in ("resolution", "stop_loss", "take_profit")]
+    # Collect all exit signals
+    exit_types = ("resolution", "stop_loss", "take_profit", "thesis_break")
+    exits = [s for s in signals if s.get("type") in exit_types]
 
     if not exits:
         print(f"{C.YELLOW}  No completed trades yet. P&L analysis requires resolved or exited positions.{C.RESET}")
@@ -433,7 +471,7 @@ def run_pnl(signals):
     # Match exits to their entry edge signals for confidence/horizon data
     edge_signals = {}
     for s in signals:
-        if s.get("type") in ("edge", "ladder"):
+        if s.get("type") in ("edge", "ladder", "entry"):
             mid = s.get("market_id")
             if mid:
                 edge_signals[mid] = s  # Keep latest
@@ -478,6 +516,38 @@ def run_pnl(signals):
     print(f"  {'─'*55}")
     pnl_color = C.GREEN if total_pnl >= 0 else C.RED
     print(f"  {'TOTAL':<10} {total_trades:>7} {' ':>4} {' ':>4} {' ':>6} {pnl_color}${total_pnl:>+9.2f}{C.RESET}")
+
+    # ── By Bucket Type ──
+    print(f"\n  {C.BOLD}By Bucket Type{C.RESET}\n")
+
+    bucket_data = defaultdict(lambda: {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+
+    for ex in exits:
+        mid = ex.get("market_id")
+        edge = edge_signals.get(mid, {})
+        source = edge if edge.get("bucket_type") or edge.get("bucket") else ex
+        bucket_type = classify_bucket_type(source)
+        pnl = ex.get("pnl", 0)
+
+        bucket_data[bucket_type]["trades"] += 1
+        bucket_data[bucket_type]["pnl"] += pnl
+        if pnl >= 0:
+            bucket_data[bucket_type]["wins"] += 1
+        else:
+            bucket_data[bucket_type]["losses"] += 1
+
+    print(f"  {'Bucket Type':<13} {'Trades':>7} {'W':>4} {'L':>4} {'Win%':>6} {'Total P&L':>11} {'Avg P&L':>9}")
+    print(f"  {'─'*60}")
+
+    for bucket_type in ["exact", "range", "or_higher", "or_below", "unknown"]:
+        d = bucket_data[bucket_type]
+        if d["trades"] == 0:
+            continue
+        win_rate = d["wins"] / d["trades"] * 100
+        avg_pnl = d["pnl"] / d["trades"]
+        pnl_color = C.GREEN if d["pnl"] >= 0 else C.RED
+        print(f"  {bucket_type:<13} {d['trades']:>7} {d['wins']:>4} {d['losses']:>4} "
+              f"{win_rate:>5.0f}% {pnl_color}${d['pnl']:>+9.2f}{C.RESET} ${avg_pnl:>+7.2f}")
 
     # ── By Horizon ──
     print(f"\n  {C.BOLD}By Forecast Horizon{C.RESET}\n")
@@ -527,13 +597,14 @@ def run_pnl(signals):
     print(f"  {'Type':<15} {'Trades':>7} {'Total P&L':>11} {'Avg P&L':>9}")
     print(f"  {'─'*45}")
 
-    for t in ["resolution", "take_profit", "stop_loss"]:
+    for t in ["resolution", "take_profit", "thesis_break", "stop_loss"]:
         d = type_data[t]
         if d["trades"] == 0:
             continue
         avg = d["pnl"] / d["trades"]
         pnl_color = C.GREEN if d["pnl"] >= 0 else C.RED
-        label = {"resolution": "Resolution", "take_profit": "Take Profit", "stop_loss": "Stop Loss"}.get(t, t)
+        label = {"resolution": "Resolution", "take_profit": "Take Profit",
+                 "thesis_break": "Thesis Break", "stop_loss": "Stop Loss"}.get(t, t)
         print(f"  {label:<15} {d['trades']:>7} {pnl_color}${d['pnl']:>+9.2f}{C.RESET} ${avg:>+7.2f}")
 
     # Insights

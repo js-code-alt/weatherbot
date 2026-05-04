@@ -449,6 +449,28 @@ def parse_temp_range(question):
         return (v - 0.5, v + 0.5)
     return None
 
+def classify_bucket_type(question, rng=None):
+    """Classify Polymarket temperature bucket shape for analytics."""
+    if question:
+        if re.search(r'or below', question, re.IGNORECASE):
+            return "or_below"
+        if re.search(r'or higher', question, re.IGNORECASE):
+            return "or_higher"
+        if re.search(r'between ', question, re.IGNORECASE):
+            return "range"
+        if re.search(r'be ' + r'(-?\d+(?:\.\d+)?)' + r'[°]?[FC] on', question, re.IGNORECASE):
+            return "exact"
+
+    if rng:
+        t_low, t_high = rng
+        if t_low <= -900:
+            return "or_below"
+        if t_high >= 900:
+            return "or_higher"
+        if abs((t_high - t_low) - 1.0) < 1e-9:
+            return "exact"
+    return "range"
+
 def hours_until_resolution(event):
     try:
         end = event.get("endDate") or event.get("end_date_iso")
@@ -463,7 +485,8 @@ def hours_until_resolution(event):
 # TEMPERATURE LADDERING
 # =============================================================================
 
-def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, model_spread):
+def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, model_spread,
+                 bucket_types=None, allowed_confidences=None):
     """Build a ladder of 2-5 adjacent underpriced buckets around consensus.
 
     Returns list of ladder rungs sorted by proximity to consensus, or empty list.
@@ -506,12 +529,15 @@ def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, mode
         confidence = classify_confidence(edge, model_spread)
         if confidence is None:
             continue
+        if allowed_confidences and confidence not in allowed_confidences:
+            continue
 
         ev_per_dollar = (prob * (1.0 / price - 1.0) - (1.0 - prob))
 
         candidates.append({
             "bucket_key": bkey,
             "range": buckets[bkey],
+            "bucket_type": (bucket_types or {}).get(bkey, classify_bucket_type(None, buckets[bkey])),
             "model_prob": round(prob, 4),
             "market_price": round(price, 4),
             "edge": round(edge, 4),
@@ -645,6 +671,7 @@ def check_exits(sim):
                 "edge": pos.get("edge"),
                 "horizon": pos.get("horizon"),
                 "bucket": pos.get("bucket"),
+                "bucket_type": pos.get("bucket_type"),
             })
 
             sim["trades"].append({
@@ -697,6 +724,10 @@ def check_exits(sim):
                 "question": pos["question"],
                 "entry_price": entry, "exit_price": current,
                 "pnl": pnl, "market_id": mid,
+                "bucket": pos.get("bucket"),
+                "bucket_type": pos.get("bucket_type"),
+                "confidence": pos.get("confidence"),
+                "horizon": pos.get("horizon"),
             })
 
             sim["trades"].append({
@@ -794,6 +825,10 @@ def apply_thesis_break_exits(sim, balance, sources, bucket_probs, market_prices,
             "current_model_prob": prob,
             "entry_sources": pos.get("entry_sources"),
             "current_sources": current_sources,
+            "bucket": pos.get("bucket"),
+            "bucket_type": pos.get("bucket_type"),
+            "confidence": pos.get("confidence"),
+            "horizon": pos.get("horizon"),
             "pnl": pnl,
             "market_id": mid,
         })
@@ -929,6 +964,7 @@ def run(dry_run=True):
             market_ids = {}   # bucket_key -> market_id
             market_questions = {}  # bucket_key -> question
             market_slugs = {}  # bucket_key -> slug from event
+            market_bucket_types = {}  # bucket_key -> exact/range/or_higher/or_below
 
             event_slug = event.get("slug", "")
 
@@ -948,6 +984,7 @@ def run(dry_run=True):
                 market_ids[bkey] = str(market.get("id", ""))
                 market_questions[bkey] = question
                 market_slugs[bkey] = market.get("slug", event_slug)
+                market_bucket_types[bkey] = classify_bucket_type(question, rng)
 
             if not buckets:
                 continue
@@ -965,15 +1002,16 @@ def run(dry_run=True):
             # Build ladder
             ladder = build_ladder(
                 buckets, bucket_probs, market_prices,
-                consensus, balance, model_spread or 0)
+                consensus, balance, model_spread or 0,
+                bucket_types=market_bucket_types,
+                allowed_confidences=("HIGH", "MEDIUM"))
 
             if not ladder:
                 continue
 
-            # Filter: only trade HIGH and MEDIUM confidence
-            tradeable = [r for r in ladder if r["confidence"] in ("HIGH", "MEDIUM")]
-            if not tradeable:
-                continue
+            # build_ladder already filters to HIGH/MEDIUM here, so sizing and
+            # combined probability match the rungs we actually enter.
+            tradeable = ladder
 
             # Display
             combined_prob = tradeable[0]["combined_hit_prob"]
@@ -1014,6 +1052,7 @@ def run(dry_run=True):
                     "city_name": loc["name"],
                     "date": date_str,
                     "bucket": rung["bucket_key"],
+                    "bucket_type": rung["bucket_type"],
                     "bucket_range": rung["range"],
                     "model_probability": rung["model_prob"],
                     "market_price": rung["market_price"],
@@ -1060,6 +1099,7 @@ def run(dry_run=True):
                         "edge": rung["edge"],
                         "horizon": day_offset,
                         "bucket": bkey,
+                        "bucket_type": rung["bucket_type"],
                         "entry_sources": list(sources.keys()),
                         "opened_at": datetime.now().isoformat(),
                     }
@@ -1072,7 +1112,36 @@ def run(dry_run=True):
                         "cost": cost,
                         "date": date_str,
                         "city": city_slug,
+                        "bucket": bkey,
+                        "bucket_type": rung["bucket_type"],
                         "opened_at": datetime.now().isoformat(),
+                    })
+                    log_signal({
+                        "type": "entry",
+                        "city": city_slug,
+                        "city_name": loc["name"],
+                        "date": date_str,
+                        "question": market_questions.get(bkey, ""),
+                        "entry_price": rung["market_price"],
+                        "market_price": rung["market_price"],
+                        "shares": round(shares, 2),
+                        "cost": cost,
+                        "market_id": mid,
+                        "market_slug": market_slugs.get(bkey, ""),
+                        "bucket": bkey,
+                        "bucket_type": rung["bucket_type"],
+                        "bucket_range": rung["range"],
+                        "model_probability": rung["model_prob"],
+                        "edge_pct": rung["edge"],
+                        "kelly_fraction": rung["kelly_raw"],
+                        "confidence": rung["confidence"],
+                        "consensus_temp": consensus,
+                        "model_spread": model_spread,
+                        "sigma_used": sigma,
+                        "horizon": day_offset,
+                        "sources": sources,
+                        "combined_hit_prob": combined_prob,
+                        "ev_per_dollar": rung["ev_per_dollar"],
                     })
                     trades_executed += 1
                     ok(f"Position opened: {market_questions.get(bkey, '')[:50]}... ${cost:.2f}")

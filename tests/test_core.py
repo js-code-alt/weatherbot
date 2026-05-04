@@ -5,7 +5,9 @@ import os
 import math
 import json
 import random
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -284,6 +286,20 @@ class TestParseTempRange(unittest.TestCase):
         q = "Will the highest temperature be -5°C or below?"
         self.assertEqual(bot_v3.parse_temp_range(q), (-999.0, -5.0))
 
+    def test_bucket_type_classification(self):
+        self.assertEqual(bot_v3.classify_bucket_type(
+            "Will the highest temperature be 72°F on April 12?",
+            (71.5, 72.5)), "exact")
+        self.assertEqual(bot_v3.classify_bucket_type(
+            "Will the highest temperature be between 70-75°F on April 12?",
+            (70.0, 75.0)), "range")
+        self.assertEqual(bot_v3.classify_bucket_type(
+            "Will it be 85°F or higher?",
+            (85.0, 999.0)), "or_higher")
+        self.assertEqual(bot_v3.classify_bucket_type(
+            "Will it be 60°F or below?",
+            (-999.0, 60.0)), "or_below")
+
 
 class TestBuildLadder(unittest.TestCase):
     """Test temperature ladder construction."""
@@ -406,6 +422,25 @@ class TestBuildLadder(unittest.TestCase):
             self.assertEqual(len(ladder), 0,
                              "edge below SINGLE_MIN_EDGE should be blocked")
 
+    def test_allowed_confidences_recomputes_tradeable_ladder_metrics(self):
+        """Allowed confidence filtering should happen before sizing/prob aggregation."""
+        original_single_min_edge = bot_v3.SINGLE_MIN_EDGE
+        bot_v3.SINGLE_MIN_EDGE = 0.15
+        try:
+            buckets = {"70-75": (70, 75), "75-80": (75, 80)}
+            probs = {"70-75": 0.50, "75-80": 0.35}
+            prices = {"70-75": 0.15, "75-80": 0.15}
+
+            ladder = bot_v3.build_ladder(
+                buckets, probs, prices, 72.5, 10000, 5.0,
+                allowed_confidences=("HIGH", "MEDIUM"))
+
+            self.assertEqual(len(ladder), 1)
+            self.assertEqual(ladder[0]["confidence"], "MEDIUM")
+            self.assertAlmostEqual(ladder[0]["combined_hit_prob"], 0.50, places=3)
+        finally:
+            bot_v3.SINGLE_MIN_EDGE = original_single_min_edge
+
 
 class TestHoursUntilResolution(unittest.TestCase):
 
@@ -490,6 +525,54 @@ class TestSimulation(unittest.TestCase):
         loaded = bot_v3.load_sim()
         self.assertEqual(loaded["balance"], 9500.0)
         self.assertIn("test_id", loaded["positions"])
+
+    def test_live_run_logs_entry_with_bucket_type(self):
+        test_log = Path("test_entry_signals_tmp.ndjson")
+        today = datetime.now().strftime("%Y-%m-%d")
+        question = f"Will the highest temperature be 72°F on {today}?"
+        original_sim_file = bot_v3.SIM_FILE
+        original_log_file = bot_v3.LOG_FILE
+
+        def fake_probs(consensus, sigma, buckets, n_sims=bot_v3.MC_SIMS, df=5):
+            return {next(iter(buckets)): 0.55}
+
+        bot_v3.SIM_FILE = self.test_file
+        bot_v3.LOG_FILE = test_log
+        try:
+            with patch.object(bot_v3, "ACTIVE_LOCATIONS", ["nyc"]), \
+                 patch.object(bot_v3, "fetch_ecmwf", return_value={today: 72.0}), \
+                 patch.object(bot_v3, "fetch_gfs", return_value={}), \
+                 patch.object(bot_v3, "fetch_icon", return_value={}), \
+                 patch.object(bot_v3, "fetch_nws", return_value={}), \
+                 patch.object(bot_v3, "fetch_ensemble", return_value={}), \
+                 patch.object(bot_v3, "get_polymarket_event", return_value={
+                     "slug": "highest-temperature-in-nyc",
+                     "markets": [{
+                         "id": "M_ENTRY",
+                         "question": question,
+                         "outcomePrices": "[0.20, 0.80]",
+                         "slug": "market-entry",
+                     }],
+                 }), \
+                 patch.object(bot_v3, "hours_until_resolution", return_value=24), \
+                 patch.object(bot_v3, "monte_carlo_bucket_probs", side_effect=fake_probs):
+                with redirect_stdout(io.StringIO()):
+                    bot_v3.run(dry_run=False)
+
+            sim = bot_v3.load_sim()
+            self.assertIn("M_ENTRY", sim["positions"])
+            self.assertEqual(sim["positions"]["M_ENTRY"]["bucket_type"], "exact")
+
+            entries = [json.loads(line) for line in test_log.read_text().splitlines()
+                       if json.loads(line).get("type") == "entry"]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["bucket_type"], "exact")
+            self.assertEqual(entries[0]["market_id"], "M_ENTRY")
+        finally:
+            bot_v3.SIM_FILE = original_sim_file
+            bot_v3.LOG_FILE = original_log_file
+            if test_log.exists():
+                test_log.unlink()
 
 
 class TestLogSignal(unittest.TestCase):
