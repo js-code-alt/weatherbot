@@ -22,6 +22,15 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# Pure decision-core (ladder/Kelly/confidence) lives in decision.py so the
+# backtests can adopt it later without dragging in network/I/O. See
+# claudedocs/decision_core_audit.md and MIGRATION.md.
+import decision as _decision
+from decision import (
+    compute_kelly,
+    classify_confidence,
+)
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -408,41 +417,34 @@ def monte_carlo_bucket_probs(consensus, sigma, buckets, n_sims=MC_SIMS, df=5):
     return bucket_probs
 
 # =============================================================================
-# KELLY CRITERION
+# KELLY CRITERION  (pure helpers live in decision.py — re-exported above)
 # =============================================================================
-
-def compute_kelly(model_prob, market_price):
-    """Quarter-Kelly sizing."""
-    if model_prob <= market_price or market_price <= 0 or market_price >= 1:
-        return 0.0
-    p = model_prob
-    q = 1.0 - p
-    b = (1.0 - market_price) / market_price
-    kelly = (p * b - q) / b
-    return max(kelly, 0.0)
 
 MIN_BET = _cfg.get("min_bet", 5.0)
 MAX_BET = _cfg.get("max_bet", 100.0)
 
+
+def _ladder_config(allowed_confidences=None):
+    """Build a decision.LadderConfig from this module's tunables."""
+    return _decision.LadderConfig(
+        min_edge=MIN_EDGE,
+        single_min_edge=SINGLE_MIN_EDGE,
+        max_price=MAX_PRICE,
+        min_entry_price=MIN_ENTRY_PRICE,
+        market_extremity_price=MARKET_EXTREMITY_PRICE,
+        market_extremity_edge_gap=MARKET_EXTREMITY_EDGE_GAP,
+        max_ladder_rungs=MAX_LADDER_RUNGS,
+        ladder_budget=LADDER_BUDGET,
+        kelly_fraction=KELLY_FRACTION,
+        min_bet=MIN_BET,
+        max_bet=MAX_BET,
+        allowed_confidences=tuple(allowed_confidences) if allowed_confidences else None,
+    )
+
+
 def kelly_bet_size(kelly_frac, bankroll):
     """Bet size from Kelly fraction, clamped to min/max from config."""
-    adjusted = kelly_frac * KELLY_FRACTION  # quarter-Kelly
-    raw = adjusted * bankroll
-    return round(min(max(raw, MIN_BET), MAX_BET), 2)
-
-# =============================================================================
-# CONFIDENCE LEVELS
-# =============================================================================
-
-def classify_confidence(edge, model_spread):
-    """Assign confidence based on edge strength and model agreement."""
-    if edge >= 0.40 and model_spread < 3.0:
-        return "HIGH"
-    elif edge >= 0.25:
-        return "MEDIUM"
-    elif edge >= 0.15:
-        return "LOW"
-    return None  # below threshold
+    return _decision.kelly_bet_size(kelly_frac, bankroll, _ladder_config())
 
 # =============================================================================
 # POLYMARKET API (kept from existing bot)
@@ -479,25 +481,7 @@ def parse_temp_range(question):
 
 def classify_bucket_type(question, rng=None):
     """Classify Polymarket temperature bucket shape for analytics."""
-    if question:
-        if re.search(r'or below', question, re.IGNORECASE):
-            return "or_below"
-        if re.search(r'or higher', question, re.IGNORECASE):
-            return "or_higher"
-        if re.search(r'between ', question, re.IGNORECASE):
-            return "range"
-        if re.search(r'be ' + r'(-?\d+(?:\.\d+)?)' + r'[°]?[FC] on', question, re.IGNORECASE):
-            return "exact"
-
-    if rng:
-        t_low, t_high = rng
-        if t_low <= -900:
-            return "or_below"
-        if t_high >= 900:
-            return "or_higher"
-        if abs((t_high - t_low) - 1.0) < 1e-9:
-            return "exact"
-    return "range"
+    return _decision.classify_bucket_type(question, rng)
 
 def hours_until_resolution(event):
     try:
@@ -513,10 +497,36 @@ def hours_until_resolution(event):
 # TEMPERATURE LADDERING
 # =============================================================================
 
+def _is_near_miss(rejection):
+    """Apply NEAR_MISS_* thresholds to a rejection record from decision.py.
+
+    Threshold logic (live-bot tuning) lives here so decision.py stays free of
+    "what's interesting enough to log" concerns. See NEAR_MISS_* constants.
+    """
+    reason = rejection["reason"]
+    edge = rejection.get("edge", 0.0)
+    price = rejection.get("market_price", 0.0)
+    if reason == "price_too_low":
+        return price >= MIN_ENTRY_PRICE - NEAR_MISS_LOW_PRICE_BAND
+    if reason == "price_too_high":
+        return price <= MAX_PRICE + NEAR_MISS_PRICE_BAND
+    if reason == "edge_below_threshold":
+        return edge >= NEAR_MISS_EDGE_RATIO * SINGLE_MIN_EDGE
+    if reason in ("market_extremity", "confidence_excluded"):
+        # These reach this point having passed every numeric gate — always
+        # interesting for guard tuning.
+        return True
+    return False
+
+
 def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, model_spread,
                  bucket_types=None, allowed_confidences=None,
                  near_miss_ctx=None):
     """Build a ladder of 2-5 adjacent underpriced buckets around consensus.
+
+    Thin wrapper around ``decision.evaluate_ladder``: assembles a LadderConfig
+    from this module's globals so live behavior is unchanged. The shared core
+    is in ``decision.py`` and is I/O-free; see claudedocs/decision_core_audit.md.
 
     Returns list of ladder rungs sorted by proximity to consensus, or empty list.
     Each rung: {bucket_key, range, model_prob, market_price, edge, kelly, bet_size, ev_per_dollar}
@@ -526,9 +536,24 @@ def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, mode
     diagnostic — does not influence trade decisions.
     """
     near_miss_ctx = near_miss_ctx or {}
+    result = _decision.evaluate_ladder(
+        consensus=consensus,
+        buckets=buckets,
+        bucket_probs=bucket_probs,
+        market_prices=market_prices,
+        bankroll=bankroll,
+        model_spread=model_spread,
+        config=_ladder_config(allowed_confidences=allowed_confidences),
+        bucket_types=bucket_types,
+    )
 
-    def _emit_near_miss(reason, bkey, prob, price, edge):
-        ctx = {
+    # Drive near-miss logging from rejection records returned by decision.py.
+    # Purely diagnostic — never affects what we trade.
+    for rej in result.rejections:
+        if not _is_near_miss(rej):
+            continue
+        bkey = rej["bucket_key"]
+        log_near_miss(rej["reason"], {
             "city": near_miss_ctx.get("city"),
             "city_name": near_miss_ctx.get("city_name"),
             "date": near_miss_ctx.get("date"),
@@ -539,111 +564,17 @@ def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, mode
             "bucket_type": (bucket_types or {}).get(bkey),
             "question": (near_miss_ctx.get("market_questions") or {}).get(bkey),
             "market_id": (near_miss_ctx.get("market_ids") or {}).get(bkey),
-            "model_prob": round(prob, 4) if prob is not None else None,
-            "market_price": round(price, 4) if price is not None else None,
-            "edge": round(edge, 4) if edge is not None else None,
+            "model_prob": round(rej["model_prob"], 4),
+            "market_price": round(rej["market_price"], 4),
+            "edge": round(rej["edge"], 4),
             "single_min_edge": SINGLE_MIN_EDGE,
             "max_price": MAX_PRICE,
             "min_entry_price": MIN_ENTRY_PRICE,
             "model_spread": model_spread,
             "consensus_temp": consensus,
-        }
-        log_near_miss(reason, ctx)
-
-    # Find all positive-EV buckets passing all gates:
-    #   - price in a tradable range (MIN_ENTRY_PRICE ≤ price ≤ MAX_PRICE)
-    #   - edge at least SINGLE_MIN_EDGE (config-driven) AND at least MIN_EDGE (ladder floor)
-    candidates = []
-    for bkey, prob in bucket_probs.items():
-        price = market_prices.get(bkey, 1.0)
-        if price <= 0 or price >= 1:
-            continue
-        if price < MIN_ENTRY_PRICE:
-            # Near-miss: price within NEAR_MISS_LOW_PRICE_BAND of the floor.
-            if price >= MIN_ENTRY_PRICE - NEAR_MISS_LOW_PRICE_BAND:
-                _emit_near_miss("price_too_low", bkey, prob, price, prob - price)
-            continue  # penny-priced longshots: high variance, small forecast errors dominate
-        if price > MAX_PRICE:
-            # Near-miss: price within NEAR_MISS_PRICE_BAND of the cap (would
-            # have passed if cap were a few cents higher).
-            if price <= MAX_PRICE + NEAR_MISS_PRICE_BAND:
-                _emit_near_miss("price_too_high", bkey, prob, price, prob - price)
-            continue  # market already overpriced relative to our tolerance
-        edge = prob - price
-        if edge < MIN_EDGE:
-            # MIN_EDGE is far below SINGLE_MIN_EDGE; treat anything ≥ ratio×SINGLE as near-miss.
-            if edge >= NEAR_MISS_EDGE_RATIO * SINGLE_MIN_EDGE:
-                _emit_near_miss("edge_below_threshold", bkey, prob, price, edge)
-            continue
-        if edge < SINGLE_MIN_EDGE:
-            # Near-miss: edge within NEAR_MISS_EDGE_RATIO of the gate.
-            if edge >= NEAR_MISS_EDGE_RATIO * SINGLE_MIN_EDGE:
-                _emit_near_miss("edge_below_threshold", bkey, prob, price, edge)
-            continue  # config-driven primary edge gate (previously unused bug)
-        if price <= MARKET_EXTREMITY_PRICE and edge >= MARKET_EXTREMITY_EDGE_GAP:
-            # Always near-miss-worthy: passed the edge gate, blocked by extremity guard.
-            _emit_near_miss("market_extremity", bkey, prob, price, edge)
-            continue  # extreme market consensus — don't fight a 10¢ market with a 30% prediction
-
-        t_low, t_high = buckets[bkey]
-        # Distance from consensus to bucket midpoint
-        if t_low == -999:
-            mid = t_high - 2
-        elif t_high == 999:
-            mid = t_low + 2
-        else:
-            mid = (t_low + t_high) / 2
-        dist = abs(consensus - mid)
-
-        kelly = compute_kelly(prob, price)
-        if kelly <= 0:
-            continue
-
-        confidence = classify_confidence(edge, model_spread)
-        if confidence is None:
-            continue
-        if allowed_confidences and confidence not in allowed_confidences:
-            # Edge passed all numeric gates but confidence (e.g. LOW) excluded.
-            _emit_near_miss("confidence_excluded", bkey, prob, price, edge)
-            continue
-
-        ev_per_dollar = (prob * (1.0 / price - 1.0) - (1.0 - prob))
-
-        candidates.append({
-            "bucket_key": bkey,
-            "range": buckets[bkey],
-            "bucket_type": (bucket_types or {}).get(bkey, classify_bucket_type(None, buckets[bkey])),
-            "model_prob": round(prob, 4),
-            "market_price": round(price, 4),
-            "edge": round(edge, 4),
-            "kelly_raw": round(kelly, 4),
-            "ev_per_dollar": round(ev_per_dollar, 4),
-            "distance": dist,
-            "confidence": confidence,
         })
 
-    if not candidates:
-        return []
-
-    # Sort by proximity to consensus (closest first)
-    candidates.sort(key=lambda x: x["distance"])
-    ladder = candidates[:MAX_LADDER_RUNGS]
-
-    # Allocate capital proportional to edge strength
-    total_edge = sum(r["edge"] for r in ladder)
-    budget = bankroll * LADDER_BUDGET
-    for rung in ladder:
-        frac = rung["edge"] / total_edge
-        raw_bet = frac * budget
-        rung["bet_size"] = round(min(max(raw_bet, MIN_BET), MAX_BET), 2)
-
-    # Combined hit probability: 1 - product(1 - prob_i)
-    combined_prob = 1.0 - math.prod(1.0 - r["model_prob"] for r in ladder)
-
-    for rung in ladder:
-        rung["combined_hit_prob"] = round(combined_prob, 4)
-
-    return ladder
+    return result.ladder
 
 # =============================================================================
 # POSITION MANAGEMENT — exits, resolution, take-profit
