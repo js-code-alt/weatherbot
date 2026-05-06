@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
@@ -45,6 +45,21 @@ class LadderConfig:
     min_bet: float = 5.0
     max_bet: float = 100.0
     allowed_confidences: Optional[Tuple[str, ...]] = None  # e.g. ("HIGH","MEDIUM")
+
+
+@dataclass
+class LadderResult:
+    """Output of ``evaluate_ladder``: the chosen ladder plus the rejection trail.
+
+    ``rejections`` is the data callers need to drive near-miss logging without
+    pulling I/O concerns into this module. Each entry has at minimum
+    ``reason`` (str), ``bucket_key`` (str), ``model_prob``, ``market_price``,
+    ``edge`` (floats). Reasons emitted: ``price_too_low``, ``price_too_high``,
+    ``edge_below_threshold``, ``market_extremity``, ``confidence_excluded``.
+    """
+
+    ladder: List[dict] = field(default_factory=list)
+    rejections: List[dict] = field(default_factory=list)
 
 
 # =============================================================================
@@ -118,15 +133,21 @@ def evaluate_ladder(
     model_spread: float,
     config: LadderConfig,
     bucket_types: Optional[Dict[str, str]] = None,
-) -> List[dict]:
+) -> LadderResult:
     """Build a ladder of 2-5 adjacent underpriced buckets around consensus.
 
-    Returns a list of ladder rungs sorted by proximity to consensus, or an
-    empty list. Each rung is a dict with keys::
+    Returns a ``LadderResult`` with two fields:
 
-        bucket_key, range, bucket_type, model_prob, market_price, edge,
-        kelly_raw, ev_per_dollar, distance, confidence, bet_size,
-        combined_hit_prob
+    - ``ladder``: list of ladder rungs sorted by proximity to consensus, or an
+      empty list. Each rung is a dict with keys::
+
+          bucket_key, range, bucket_type, model_prob, market_price, edge,
+          kelly_raw, ev_per_dollar, distance, confidence, bet_size,
+          combined_hit_prob
+
+    - ``rejections``: list of records describing why each non-passing bucket
+      was rejected. Lets callers (e.g. ``bot_v3.build_ladder``) drive near-miss
+      logging without pulling I/O into this module.
 
     This is a pure function: no I/O, no globals. ``consensus`` is the weighted
     forecast temperature; ``buckets`` maps a bucket key to ``(t_low, t_high)``;
@@ -134,20 +155,37 @@ def evaluate_ladder(
     price per bucket; ``model_spread`` is max(temps)-min(temps) across models.
     """
     candidates: List[dict] = []
+    rejections: List[dict] = []
+
+    def _reject(reason, bkey, prob, price, edge):
+        rejections.append({
+            "reason": reason,
+            "bucket_key": bkey,
+            "model_prob": prob,
+            "market_price": price,
+            "edge": edge,
+        })
+
     for bkey, prob in bucket_probs.items():
         price = market_prices.get(bkey, 1.0)
         if price <= 0 or price >= 1:
+            # Untradeable price — not interesting for near-miss diagnostics.
             continue
+        edge = prob - price
         if price < config.min_entry_price:
+            _reject("price_too_low", bkey, prob, price, edge)
             continue  # penny-priced longshots: high variance, small forecast errors dominate
         if price > config.max_price:
+            _reject("price_too_high", bkey, prob, price, edge)
             continue  # market already overpriced relative to our tolerance
-        edge = prob - price
         if edge < config.min_edge:
+            _reject("edge_below_threshold", bkey, prob, price, edge)
             continue
         if edge < config.single_min_edge:
+            _reject("edge_below_threshold", bkey, prob, price, edge)
             continue  # config-driven primary edge gate
         if price <= config.market_extremity_price and edge >= config.market_extremity_edge_gap:
+            _reject("market_extremity", bkey, prob, price, edge)
             continue  # extreme market consensus — don't fight a 10¢ market with a 30% prediction
 
         t_low, t_high = buckets[bkey]
@@ -162,12 +200,17 @@ def evaluate_ladder(
 
         kelly = compute_kelly(prob, price)
         if kelly <= 0:
+            # Numerically unprofitable — already excluded by the edge gate above
+            # in practice; not interesting as a near-miss.
             continue
 
         confidence = classify_confidence(edge, model_spread)
         if confidence is None:
+            # edge < 0.15 — would have been caught by edge gates with default
+            # config; not a near-miss either.
             continue
         if config.allowed_confidences and confidence not in config.allowed_confidences:
+            _reject("confidence_excluded", bkey, prob, price, edge)
             continue
 
         ev_per_dollar = (prob * (1.0 / price - 1.0) - (1.0 - prob))
@@ -186,7 +229,7 @@ def evaluate_ladder(
         })
 
     if not candidates:
-        return []
+        return LadderResult(ladder=[], rejections=rejections)
 
     # Sort by proximity to consensus (closest first)
     candidates.sort(key=lambda x: x["distance"])
@@ -205,4 +248,4 @@ def evaluate_ladder(
     for rung in ladder:
         rung["combined_hit_prob"] = round(combined_prob, 4)
 
-    return ladder
+    return LadderResult(ladder=ladder, rejections=rejections)

@@ -89,14 +89,16 @@ confidence — so the easiest port is:
 buckets    = {tok: (bl, bh)}
 probs      = {tok: bp}
 prices     = {tok: price}
-ladder = evaluate_ladder(
+result = evaluate_ladder(
     consensus=cons, buckets=buckets, bucket_probs=probs, market_prices=prices,
     bankroll=self.bankroll, model_spread=0.0,  # spread unknown in this sim
     config=self.config,
 )
-if not ladder: continue
-rung = ladder[0]
+if not result.ladder: continue
+rung = result.ladder[0]
 stake = rung["bet_size"]
+# result.rejections holds rejection records if you want backtest-level
+# near-miss diagnostics — see bot_v3.build_ladder for the live pattern.
 ```
 
 ### Step 4: keep the per-tick loop and the take-profit logic
@@ -163,9 +165,10 @@ If you add tests for `decision.py` directly (recommended), put them in
 
 - Should `LadderConfig` be loadable from `config.json` directly? Today
   `bot_v3._ladder_config()` reads its module globals.
-- Should we expose `evaluate_ladder` results via a dataclass instead of a
-  dict? Would catch typos at type-check time; would also mean updating every
-  call site that indexes into the rung dict.
+- Should we expose individual rungs via a dataclass instead of a dict?
+  Would catch typos at type-check time; would also mean updating every call
+  site that indexes into the rung dict. (Note: the top-level result is
+  already a `LadderResult` dataclass with `.ladder` and `.rejections`.)
 - Should `monte_carlo_bucket_probs` move into `decision.py`? It's pure and
   already duplicated three places. Held back because the three copies have
   slightly different edge-bucket conventions, which is exactly the kind of
