@@ -66,6 +66,16 @@ SIM_FILE = "simulation_v3.json"
 LOG_DIR  = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "weather-signals.ndjson"
+NEAR_MISS_LOG = LOG_DIR / "near_misses.ndjson"
+
+# --- Near-miss thresholds ---------------------------------------------------
+# A "near miss" is a candidate signal that was rejected but only barely. We log
+# these (purely additively, no impact on trade decisions) so guard tuning can
+# be evidence-based when trade cadence collapses.
+NEAR_MISS_EDGE_RATIO    = 0.7   # edge ≥ 0.7×SINGLE_MIN_EDGE counts (e.g. 0.175 if gate is 0.25)
+NEAR_MISS_PRICE_BAND    = 0.05  # price within 0.05 of MAX_PRICE cap counts as near-miss
+NEAR_MISS_LOW_PRICE_BAND = 0.02 # price within 0.02 of MIN_ENTRY_PRICE counts
+NEAR_MISS_HOURS_RATIO   = 0.25  # hours within 25% of MIN_HOURS or MAX_HOURS bounds counts
 
 # Sigma floors by forecast horizon (days out)
 SIGMA_FLOORS = {0: 3.0, 1: 1.7, 2: 2.2, 3: 2.9, 4: 3.2}
@@ -155,6 +165,24 @@ def log_signal(entry: dict):
     entry["timestamp"] = datetime.now(timezone.utc).isoformat()
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(entry, default=str) + "\n")
+
+def log_near_miss(reason: str, ctx: dict):
+    """Append a near-miss record to NEAR_MISS_LOG.
+
+    Purely additive — never affects trade decisions. Used to diagnose why
+    cadence falls (guards working vs guards too tight). Only "near" rejections
+    are logged — see NEAR_MISS_* thresholds above.
+    """
+    entry = dict(ctx)
+    entry["reason"] = reason
+    entry["timestamp"] = datetime.now(timezone.utc).isoformat()
+    try:
+        NEAR_MISS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(NEAR_MISS_LOG, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        # Logging failures must never break the scan.
+        pass
 
 # =============================================================================
 # FORECAST FETCHERS
@@ -486,12 +514,42 @@ def hours_until_resolution(event):
 # =============================================================================
 
 def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, model_spread,
-                 bucket_types=None, allowed_confidences=None):
+                 bucket_types=None, allowed_confidences=None,
+                 near_miss_ctx=None):
     """Build a ladder of 2-5 adjacent underpriced buckets around consensus.
 
     Returns list of ladder rungs sorted by proximity to consensus, or empty list.
     Each rung: {bucket_key, range, model_prob, market_price, edge, kelly, bet_size, ev_per_dollar}
+
+    `near_miss_ctx` (optional): dict of caller-side context (city, date, hours,
+    market_questions, market_ids) attached to any near-miss log line. Purely
+    diagnostic — does not influence trade decisions.
     """
+    near_miss_ctx = near_miss_ctx or {}
+
+    def _emit_near_miss(reason, bkey, prob, price, edge):
+        ctx = {
+            "city": near_miss_ctx.get("city"),
+            "city_name": near_miss_ctx.get("city_name"),
+            "date": near_miss_ctx.get("date"),
+            "hours_to_resolution": near_miss_ctx.get("hours"),
+            "horizon": near_miss_ctx.get("horizon"),
+            "bucket": bkey,
+            "bucket_range": list(buckets.get(bkey, ())),
+            "bucket_type": (bucket_types or {}).get(bkey),
+            "question": (near_miss_ctx.get("market_questions") or {}).get(bkey),
+            "market_id": (near_miss_ctx.get("market_ids") or {}).get(bkey),
+            "model_prob": round(prob, 4) if prob is not None else None,
+            "market_price": round(price, 4) if price is not None else None,
+            "edge": round(edge, 4) if edge is not None else None,
+            "single_min_edge": SINGLE_MIN_EDGE,
+            "max_price": MAX_PRICE,
+            "min_entry_price": MIN_ENTRY_PRICE,
+            "model_spread": model_spread,
+            "consensus_temp": consensus,
+        }
+        log_near_miss(reason, ctx)
+
     # Find all positive-EV buckets passing all gates:
     #   - price in a tradable range (MIN_ENTRY_PRICE ≤ price ≤ MAX_PRICE)
     #   - edge at least SINGLE_MIN_EDGE (config-driven) AND at least MIN_EDGE (ladder floor)
@@ -501,15 +559,30 @@ def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, mode
         if price <= 0 or price >= 1:
             continue
         if price < MIN_ENTRY_PRICE:
+            # Near-miss: price within NEAR_MISS_LOW_PRICE_BAND of the floor.
+            if price >= MIN_ENTRY_PRICE - NEAR_MISS_LOW_PRICE_BAND:
+                _emit_near_miss("price_too_low", bkey, prob, price, prob - price)
             continue  # penny-priced longshots: high variance, small forecast errors dominate
         if price > MAX_PRICE:
+            # Near-miss: price within NEAR_MISS_PRICE_BAND of the cap (would
+            # have passed if cap were a few cents higher).
+            if price <= MAX_PRICE + NEAR_MISS_PRICE_BAND:
+                _emit_near_miss("price_too_high", bkey, prob, price, prob - price)
             continue  # market already overpriced relative to our tolerance
         edge = prob - price
         if edge < MIN_EDGE:
+            # MIN_EDGE is far below SINGLE_MIN_EDGE; treat anything ≥ ratio×SINGLE as near-miss.
+            if edge >= NEAR_MISS_EDGE_RATIO * SINGLE_MIN_EDGE:
+                _emit_near_miss("edge_below_threshold", bkey, prob, price, edge)
             continue
         if edge < SINGLE_MIN_EDGE:
+            # Near-miss: edge within NEAR_MISS_EDGE_RATIO of the gate.
+            if edge >= NEAR_MISS_EDGE_RATIO * SINGLE_MIN_EDGE:
+                _emit_near_miss("edge_below_threshold", bkey, prob, price, edge)
             continue  # config-driven primary edge gate (previously unused bug)
         if price <= MARKET_EXTREMITY_PRICE and edge >= MARKET_EXTREMITY_EDGE_GAP:
+            # Always near-miss-worthy: passed the edge gate, blocked by extremity guard.
+            _emit_near_miss("market_extremity", bkey, prob, price, edge)
             continue  # extreme market consensus — don't fight a 10¢ market with a 30% prediction
 
         t_low, t_high = buckets[bkey]
@@ -530,6 +603,8 @@ def build_ladder(buckets, bucket_probs, market_prices, consensus, bankroll, mode
         if confidence is None:
             continue
         if allowed_confidences and confidence not in allowed_confidences:
+            # Edge passed all numeric gates but confidence (e.g. LOW) excluded.
+            _emit_near_miss("confidence_excluded", bkey, prob, price, edge)
             continue
 
         ev_per_dollar = (prob * (1.0 / price - 1.0) - (1.0 - prob))
@@ -956,6 +1031,21 @@ def run(dry_run=True):
 
             hours = hours_until_resolution(event)
             if hours < MIN_HOURS or hours > MAX_HOURS:
+                # Near-miss: hours within NEAR_MISS_HOURS_RATIO (25%) of either bound.
+                lower_band = MIN_HOURS * (1.0 - NEAR_MISS_HOURS_RATIO)
+                upper_band = MAX_HOURS * (1.0 + NEAR_MISS_HOURS_RATIO)
+                if lower_band <= hours <= upper_band:
+                    log_near_miss("hours_out_of_bounds", {
+                        "city": city_slug,
+                        "city_name": loc.get("name"),
+                        "date": date_str,
+                        "horizon": day_offset,
+                        "hours_to_resolution": hours,
+                        "min_hours": MIN_HOURS,
+                        "max_hours": MAX_HOURS,
+                        "consensus_temp": consensus,
+                        "event_slug": event.get("slug", ""),
+                    })
                 continue
 
             # Parse all market buckets
@@ -1004,7 +1094,16 @@ def run(dry_run=True):
                 buckets, bucket_probs, market_prices,
                 consensus, balance, model_spread or 0,
                 bucket_types=market_bucket_types,
-                allowed_confidences=("HIGH", "MEDIUM"))
+                allowed_confidences=("HIGH", "MEDIUM"),
+                near_miss_ctx={
+                    "city": city_slug,
+                    "city_name": loc.get("name"),
+                    "date": date_str,
+                    "horizon": day_offset,
+                    "hours": hours,
+                    "market_questions": market_questions,
+                    "market_ids": market_ids,
+                })
 
             if not ladder:
                 continue

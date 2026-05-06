@@ -602,6 +602,82 @@ class TestLogSignal(unittest.TestCase):
         self.assertEqual(entry2["type"], "ladder")
 
 
+class TestNearMissLogging(unittest.TestCase):
+    """Verify near-miss logging records rejected-but-close signals without
+    affecting trade decisions."""
+
+    def setUp(self):
+        self.test_log = Path("test_near_misses_tmp.ndjson")
+        self._original = bot_v3.NEAR_MISS_LOG
+        bot_v3.NEAR_MISS_LOG = self.test_log
+        if self.test_log.exists():
+            self.test_log.unlink()
+
+    def tearDown(self):
+        bot_v3.NEAR_MISS_LOG = self._original
+        if self.test_log.exists():
+            self.test_log.unlink()
+
+    def _read_lines(self):
+        if not self.test_log.exists():
+            return []
+        return [json.loads(line) for line in self.test_log.read_text().splitlines() if line.strip()]
+
+    def test_market_extremity_logs_near_miss(self):
+        # Mirrors test_market_extremity_blocks_high_edge: market 7¢, model 34%,
+        # edge 27pp. The extremity guard rejects this — it should leave a
+        # near-miss trace AND still return an empty ladder.
+        probs = {"70-75": 0.34}
+        prices = {"70-75": 0.07}
+        buckets = {"70-75": (70, 75)}
+        ladder = bot_v3.build_ladder(
+            buckets, probs, prices, 72.5, 10000, 1.0,
+            near_miss_ctx={"city": "denver", "date": "2026-04-26", "hours": 18.0},
+        )
+        # Trade decision unchanged: still no ladder.
+        self.assertEqual(len(ladder), 0)
+
+        records = self._read_lines()
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["reason"], "market_extremity")
+        self.assertEqual(rec["city"], "denver")
+        self.assertEqual(rec["bucket"], "70-75")
+        self.assertAlmostEqual(rec["model_prob"], 0.34, places=4)
+        self.assertAlmostEqual(rec["market_price"], 0.07, places=4)
+        self.assertAlmostEqual(rec["edge"], 0.27, places=4)
+        self.assertIn("timestamp", rec)
+
+    def test_far_from_threshold_not_logged(self):
+        # Edge of 0.05 (prob 0.20, price 0.15) is far below SINGLE_MIN_EDGE
+        # (0.25) and below NEAR_MISS_EDGE_RATIO * 0.25 = 0.175. Should NOT log.
+        probs = {"70-75": 0.20}
+        prices = {"70-75": 0.15}
+        buckets = {"70-75": (70, 75)}
+        ladder = bot_v3.build_ladder(
+            buckets, probs, prices, 72.5, 10000, 1.0,
+            near_miss_ctx={"city": "nyc", "date": "2026-05-01", "hours": 24.0},
+        )
+        self.assertEqual(len(ladder), 0)
+        # No log line — this is noise, not a near-miss.
+        self.assertEqual(self._read_lines(), [])
+
+    def test_edge_just_below_gate_logs_near_miss(self):
+        # Edge = 0.20, just below SINGLE_MIN_EDGE 0.25 but ≥ 0.7×0.25 = 0.175.
+        probs = {"70-75": 0.30}
+        prices = {"70-75": 0.10}
+        buckets = {"70-75": (70, 75)}
+        ladder = bot_v3.build_ladder(
+            buckets, probs, prices, 72.5, 10000, 1.0,
+            near_miss_ctx={"city": "miami", "date": "2026-05-02", "hours": 30.0},
+        )
+        self.assertEqual(len(ladder), 0)
+        records = self._read_lines()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["reason"], "edge_below_threshold")
+        self.assertAlmostEqual(records[0]["edge"], 0.20, places=4)
+
+
 class TestThesisBreakExit(unittest.TestCase):
     """Verify thesis-break exit rules: source degradation, model decay, edge collapse."""
 
